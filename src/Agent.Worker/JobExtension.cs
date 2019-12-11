@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
@@ -7,6 +10,7 @@ using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System.Linq;
 using System.Diagnostics;
+using Agent.Sdk;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -65,8 +69,16 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     context.Section(StringUtil.Loc("StepStarting", StringUtil.Loc("InitializeJob")));
 
                     // Set agent version variable.
-                    context.Variables.Set(Constants.Variables.Agent.Version, Constants.Agent.Version);
-                    context.Output(StringUtil.Loc("AgentVersion", Constants.Agent.Version));
+                    context.SetVariable(Constants.Variables.Agent.Version, BuildConstants.AgentPackage.Version);
+                    context.Output(StringUtil.Loc("AgentNameLog", context.Variables.Get(Constants.Variables.Agent.Name)));
+                    context.Output(StringUtil.Loc("AgentMachineNameLog", context.Variables.Get(Constants.Variables.Agent.MachineName)));
+                    context.Output(StringUtil.Loc("AgentVersion", BuildConstants.AgentPackage.Version));
+                    string imageVersion = System.Environment.GetEnvironmentVariable(Constants.ImageVersionVariable);
+                    if (imageVersion != null)
+                    {
+                        context.Output(StringUtil.Loc("ImageVersionLog", imageVersion));
+                    }
+                    context.Output(StringUtil.Loc("UserNameLog", System.Environment.UserName));
 
                     // Print proxy setting information for better diagnostic experience
                     var agentWebProxy = HostContext.GetService<IVstsAgentWebProxy>();
@@ -104,38 +116,36 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                         taskConditionMap[task.Id] = condition;
                     }
 
-#if OS_WINDOWS
-                    // This is for internal testing and is not publicly supported. This will be removed from the agent at a later time.
-                    var prepareScript = Environment.GetEnvironmentVariable("VSTS_AGENT_INIT_INTERNAL_TEMP_HACK");
-                    ServiceEndpoint systemConnection = context.Endpoints.Single(x => string.Equals(x.Name, WellKnownServiceEndpointNames.SystemVssConnection, StringComparison.OrdinalIgnoreCase));
-                    if (!string.IsNullOrEmpty(prepareScript) && context.Container == null)
+                    if (PlatformUtil.RunningOnWindows)
                     {
-                        var prepareStep = new ManagementScriptStep(
-                            scriptPath: prepareScript,
-                            condition: ExpressionManager.Succeeded,
-                            displayName: "Agent Initialization");
+                        // This is for internal testing and is not publicly supported. This will be removed from the agent at a later time.
+                        var prepareScript = Environment.GetEnvironmentVariable("VSTS_AGENT_INIT_INTERNAL_TEMP_HACK");
+                        ServiceEndpoint systemConnection = context.Endpoints.Single(x => string.Equals(x.Name, WellKnownServiceEndpointNames.SystemVssConnection, StringComparison.OrdinalIgnoreCase));
+                        if (!string.IsNullOrEmpty(prepareScript) && context.StepTarget() is HostInfo)
+                        {
+                            var prepareStep = new ManagementScriptStep(
+                                scriptPath: prepareScript,
+                                condition: ExpressionManager.Succeeded,
+                                displayName: "Agent Initialization");
 
-                        Trace.Verbose($"Adding agent init script step.");
-                        prepareStep.Initialize(HostContext);
-                        prepareStep.ExecutionContext = jobContext.CreateChild(Guid.NewGuid(), prepareStep.DisplayName, nameof(ManagementScriptStep));
-                        prepareStep.AccessToken = systemConnection.Authorization.Parameters["AccessToken"];
-                        prepareStep.Condition = ExpressionManager.Succeeded;
-                        preJobSteps.Add(prepareStep);
+                            Trace.Verbose($"Adding agent init script step.");
+                            prepareStep.Initialize(HostContext);
+                            prepareStep.ExecutionContext = jobContext.CreateChild(Guid.NewGuid(), prepareStep.DisplayName, nameof(ManagementScriptStep));
+                            prepareStep.AccessToken = systemConnection.Authorization.Parameters["AccessToken"];
+                            prepareStep.Condition = ExpressionManager.Succeeded;
+                            preJobSteps.Add(prepareStep);
+                        }
                     }
-#endif
 
                     // build up 3 lists of steps, pre-job, job, post-job
                     Stack<IStep> postJobStepsBuilder = new Stack<IStep>();
                     Dictionary<Guid, Variables> taskVariablesMapping = new Dictionary<Guid, Variables>();
 
-                    if (context.Container != null || context.SidecarContainers.Count > 0)
+                    if (context.Containers.Count > 0 || context.SidecarContainers.Count > 0)
                     {
                         var containerProvider = HostContext.GetService<IContainerOperationProvider>();
-                        var containers = new List<Container.ContainerInfo>();
-                        if (context.Container != null)
-                        {
-                            containers.Add(context.Container);
-                        }
+                        var containers = new List<ContainerInfo>();
+                        containers.AddRange(context.Containers);
                         containers.AddRange(context.SidecarContainers);
 
                         preJobSteps.Add(new JobExtensionRunner(runAsync: containerProvider.StartContainersAsync,
@@ -208,12 +218,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     // create execution context for all pre-job steps
                     foreach (var step in preJobSteps)
                     {
-#if OS_WINDOWS
-                        if (step is ManagementScriptStep)
+                        if (PlatformUtil.RunningOnWindows && step is ManagementScriptStep)
                         {
                             continue;
                         }
-#endif
+
                         if (step is JobExtensionRunner)
                         {
                             JobExtensionRunner extensionStep = step as JobExtensionRunner;
@@ -262,25 +271,28 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                         }
                     }
 
-#if OS_WINDOWS
-                    // Add script post steps.
-                    // This is for internal testing and is not publicly supported. This will be removed from the agent at a later time.
-                    var finallyScript = Environment.GetEnvironmentVariable("VSTS_AGENT_CLEANUP_INTERNAL_TEMP_HACK");
-                    if (!string.IsNullOrEmpty(finallyScript) && context.Container == null)
+                    if (PlatformUtil.RunningOnWindows)
                     {
-                        var finallyStep = new ManagementScriptStep(
-                            scriptPath: finallyScript,
-                            condition: ExpressionManager.Always,
-                            displayName: "Agent Cleanup");
+                        // Add script post steps.
+                        // This is for internal testing and is not publicly supported. This will be removed from the agent at a later time.
+                        var finallyScript = Environment.GetEnvironmentVariable("VSTS_AGENT_CLEANUP_INTERNAL_TEMP_HACK");
+                        if (!string.IsNullOrEmpty(finallyScript) && context.StepTarget() is HostInfo)
+                        {
+                            var finallyStep = new ManagementScriptStep(
+                                scriptPath: finallyScript,
+                                condition: ExpressionManager.Always,
+                                displayName: "Agent Cleanup");
 
-                        Trace.Verbose($"Adding agent cleanup script step.");
-                        finallyStep.Initialize(HostContext);
-                        finallyStep.ExecutionContext = jobContext.CreateChild(Guid.NewGuid(), finallyStep.DisplayName, nameof(ManagementScriptStep));
-                        finallyStep.Condition = ExpressionManager.Always;
-                        finallyStep.AccessToken = systemConnection.Authorization.Parameters["AccessToken"];
-                        postJobSteps.Add(finallyStep);
+                            Trace.Verbose($"Adding agent cleanup script step.");
+                            finallyStep.Initialize(HostContext);
+                            finallyStep.ExecutionContext = jobContext.CreateChild(Guid.NewGuid(), finallyStep.DisplayName, nameof(ManagementScriptStep));
+                            finallyStep.Condition = ExpressionManager.Always;
+                            ServiceEndpoint systemConnection = context.Endpoints.Single(x => string.Equals(x.Name, WellKnownServiceEndpointNames.SystemVssConnection, StringComparison.OrdinalIgnoreCase));
+                            finallyStep.AccessToken = systemConnection.Authorization.Parameters["AccessToken"];
+                            postJobSteps.Add(finallyStep);
+                        }
                     }
-#endif
+
                     List<IStep> steps = new List<IStep>();
                     steps.AddRange(preJobSteps);
                     steps.AddRange(jobSteps);

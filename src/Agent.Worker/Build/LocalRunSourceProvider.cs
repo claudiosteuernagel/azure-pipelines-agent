@@ -1,3 +1,7 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Agent.Sdk;
 using Microsoft.TeamFoundation.Build.WebApi;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Util;
@@ -23,13 +27,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
             ArgUtil.NotNull(executionContext, nameof(executionContext));
             ArgUtil.NotNull(endpoint, nameof(endpoint));
 
-            bool preferGitFromPath;
-#if OS_WINDOWS
-            preferGitFromPath = false;
-#else
-            preferGitFromPath = true;
-#endif
-            if (!preferGitFromPath)
+            if (PlatformUtil.RunningOnWindows)
             {
                 // Add git to the PATH.
                 string gitPath = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), "git", "cmd", $"git{IOUtil.ExeExtension}");
@@ -52,9 +50,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
             string localDirectory = endpoint.Data?["localDirectory"];
             ArgUtil.Directory(localDirectory, nameof(localDirectory));
             ArgUtil.Directory(Path.Combine(localDirectory, ".git"), "localDotGitDirectory");
-            executionContext.Variables.Set(Constants.Variables.System.DefaultWorkingDirectory, localDirectory);
-            executionContext.Variables.Set(Constants.Variables.Build.SourcesDirectory, localDirectory);
-            executionContext.Variables.Set(Constants.Variables.Build.RepoLocalPath, localDirectory);
+            executionContext.SetVariable(Constants.Variables.System.DefaultWorkingDirectory, localDirectory);
+            executionContext.SetVariable(Constants.Variables.Build.SourcesDirectory, localDirectory);
+            executionContext.SetVariable(Constants.Variables.Build.RepoLocalPath, localDirectory);
 
             // todo: consider support for clean
 

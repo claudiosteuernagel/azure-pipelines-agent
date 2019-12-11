@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Worker;
 using Moq;
@@ -342,10 +345,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker
             }
         }
 
-#if OS_WINDOWS
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Worker")]
+        [Trait("SkipOn", "darwin")]
+        [Trait("SkipOn", "linux")]
         public async Task JobExtensionManagementScriptStep()
         {
             using (TestHostContext hc = CreateTestContext())
@@ -381,6 +385,5 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker
                 }
             }
         }
-#endif
     }
 }

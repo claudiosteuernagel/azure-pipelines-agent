@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using Microsoft.TeamFoundation.Build.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using System;
@@ -7,7 +10,6 @@ using System.Threading.Tasks;
 using System.IO;
 using System.Text.RegularExpressions;
 using System.Text;
-using System.Diagnostics;
 using Agent.Sdk;
 using System.Linq;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
@@ -18,6 +20,14 @@ namespace Agent.Plugins.Repository
 {
     public class ExternalGitSourceProvider : GitSourceProvider
     {
+        public override bool GitSupportsFetchingCommitBySha1Hash
+        {
+            get
+            {
+                return false;
+            }
+        }
+
         // external git repository won't use auth header cmdline arg, since we don't know the auth scheme.
         public override bool GitSupportUseAuthHeader(AgentTaskPluginExecutionContext executionContext, GitCliManager gitCommandManager)
         {
@@ -31,24 +41,22 @@ namespace Agent.Plugins.Repository
 
         public override void RequirementCheck(AgentTaskPluginExecutionContext executionContext, Pipelines.RepositoryResource repository, GitCliManager gitCommandManager)
         {
-#if OS_WINDOWS
             // check git version for SChannel SSLBackend (Windows Only)
             bool schannelSslBackend = StringUtil.ConvertToBoolean(executionContext.Variables.GetValueOrDefault("agent.gituseschannel")?.Value);
-            if (schannelSslBackend)
+            if (schannelSslBackend && PlatformUtil.RunningOnWindows)
             {
                 gitCommandManager.EnsureGitVersion(_minGitVersionSupportSSLBackendOverride, throwOnNotMatch: true);
             }
-#endif
         }
 
         public override string GenerateAuthHeader(AgentTaskPluginExecutionContext executionContext, string username, string password)
         {
-            // can't generate auth header for external git. 
+            // can't generate auth header for external git.
             throw new NotSupportedException(nameof(ExternalGitSourceProvider.GenerateAuthHeader));
         }
     }
 
-    public sealed class AuthenticatedGitSourceProvider : GitSourceProvider
+    public abstract class AuthenticatedGitSourceProvider : GitSourceProvider
     {
         public override bool GitSupportUseAuthHeader(AgentTaskPluginExecutionContext executionContext, GitCliManager gitCommandManager)
         {
@@ -64,19 +72,17 @@ namespace Agent.Plugins.Repository
 
         public override void RequirementCheck(AgentTaskPluginExecutionContext executionContext, Pipelines.RepositoryResource repository, GitCliManager gitCommandManager)
         {
-#if OS_WINDOWS
             // check git version for SChannel SSLBackend (Windows Only)
             bool schannelSslBackend = StringUtil.ConvertToBoolean(executionContext.Variables.GetValueOrDefault("agent.gituseschannel")?.Value);
-            if (schannelSslBackend)
+            if (schannelSslBackend && PlatformUtil.RunningOnWindows)
             {
                 gitCommandManager.EnsureGitVersion(_minGitVersionSupportSSLBackendOverride, throwOnNotMatch: true);
             }
-#endif
         }
 
         public override string GenerateAuthHeader(AgentTaskPluginExecutionContext executionContext, string username, string password)
         {
-            // use basic auth header with username:password in base64encoding. 
+            // use basic auth header with username:password in base64encoding.
             string authHeader = $"{username ?? string.Empty}:{password ?? string.Empty}";
             string base64encodedAuthHeader = Convert.ToBase64String(Encoding.UTF8.GetBytes(authHeader));
 
@@ -86,8 +92,38 @@ namespace Agent.Plugins.Repository
         }
     }
 
+    public sealed class BitbucketGitSourceProvider : AuthenticatedGitSourceProvider
+    {
+        public override bool GitSupportsFetchingCommitBySha1Hash
+        {
+            get
+            {
+                return true;
+            }
+        }
+    }
+
+    public sealed class GitHubSourceProvider : AuthenticatedGitSourceProvider
+    {
+        public override bool GitSupportsFetchingCommitBySha1Hash
+        {
+            get
+            {
+                return false;
+            }
+        }
+    }
+
     public sealed class TfsGitSourceProvider : GitSourceProvider
     {
+        public override bool GitSupportsFetchingCommitBySha1Hash
+        {
+            get
+            {
+                return true;
+            }
+        }
+
         public override bool GitSupportUseAuthHeader(AgentTaskPluginExecutionContext executionContext, GitCliManager gitCommandManager)
         {
             // v2.9 git exist use auth header for tfsgit repository.
@@ -134,14 +170,12 @@ namespace Agent.Plugins.Repository
                 }
             }
 
-#if OS_WINDOWS
             // check git version for SChannel SSLBackend (Windows Only)
             bool schannelSslBackend = StringUtil.ConvertToBoolean(executionContext.Variables.GetValueOrDefault("agent.gituseschannel")?.Value);
-            if (schannelSslBackend)
+            if (schannelSslBackend && PlatformUtil.RunningOnWindows)
             {
                 gitCommandManager.EnsureGitVersion(_minGitVersionSupportSSLBackendOverride, throwOnNotMatch: true);
             }
-#endif
         }
 
         public override string GenerateAuthHeader(AgentTaskPluginExecutionContext executionContext, string username, string password)
@@ -164,10 +198,8 @@ namespace Agent.Plugins.Repository
         // min git version that support add extra auth header.
         protected Version _minGitVersionSupportAuthHeader = new Version(2, 9);
 
-#if OS_WINDOWS
         // min git version that support override sslBackend setting.
         protected Version _minGitVersionSupportSSLBackendOverride = new Version(2, 14, 2);
-#endif
 
         // min git-lfs version that support add extra auth header.
         protected Version _minGitLfsVersionSupportAuthHeader = new Version(2, 1);
@@ -176,6 +208,8 @@ namespace Agent.Plugins.Repository
         public abstract bool GitLfsSupportUseAuthHeader(AgentTaskPluginExecutionContext executionContext, GitCliManager gitCommandManager);
         public abstract void RequirementCheck(AgentTaskPluginExecutionContext executionContext, Pipelines.RepositoryResource repository, GitCliManager gitCommandManager);
         public abstract string GenerateAuthHeader(AgentTaskPluginExecutionContext executionContext, string username, string password);
+
+        public abstract bool GitSupportsFetchingCommitBySha1Hash { get; }
 
         public async Task GetSourceAsync(
             AgentTaskPluginExecutionContext executionContext,
@@ -197,6 +231,15 @@ namespace Agent.Plugins.Repository
             string clientCertPrivateKeyAskPassFile = null;
             bool acceptUntrustedCerts = false;
 
+            bool reducedOutput = StringUtil.ConvertToBoolean(
+                executionContext.Variables.GetValueOrDefault("agent.source.checkout.quiet")?.Value ??
+                System.Environment.GetEnvironmentVariable("AGENT_SOURCE_CHECKOUT_QUIET"), false);
+            if (reducedOutput)
+            {
+                executionContext.Output(StringUtil.Loc("QuietCheckoutModeRequested"));
+                executionContext.SetTaskVariable("agent.source.checkout.quiet", "false");
+            }
+
             executionContext.Output($"Syncing repository: {repository.Properties.Get<string>(Pipelines.RepositoryPropertyNames.Name)} ({repository.Type})");
             Uri repositoryUrl = repository.Url;
             if (!repositoryUrl.IsAbsoluteUri)
@@ -210,15 +253,23 @@ namespace Agent.Plugins.Repository
 
             bool clean = StringUtil.ConvertToBoolean(executionContext.GetInput(Pipelines.PipelineConstants.CheckoutTaskInputs.Clean));
 
+            // input Submodules can be ['', true, false, recursive]
+            // '' or false indicate don't checkout submodules
+            // true indicate checkout top level submodules
+            // recursive indicate checkout submodules recursively
             bool checkoutSubmodules = false;
             bool checkoutNestedSubmodules = false;
             string submoduleInput = executionContext.GetInput(Pipelines.PipelineConstants.CheckoutTaskInputs.Submodules);
             if (!string.IsNullOrEmpty(submoduleInput))
             {
-                checkoutSubmodules = true;
                 if (string.Equals(submoduleInput, Pipelines.PipelineConstants.CheckoutTaskInputs.SubmodulesOptions.Recursive, StringComparison.OrdinalIgnoreCase))
                 {
+                    checkoutSubmodules = true;
                     checkoutNestedSubmodules = true;
+                }
+                else
+                {
+                    checkoutSubmodules = StringUtil.ConvertToBoolean(submoduleInput);
                 }
             }
 
@@ -262,6 +313,11 @@ namespace Agent.Plugins.Repository
 
             bool exposeCred = StringUtil.ConvertToBoolean(executionContext.GetInput(Pipelines.PipelineConstants.CheckoutTaskInputs.PersistCredentials));
 
+            // Read 'disable fetch by commit' value from the execution variable first, then from the environment variable if the first one is not set
+            bool fetchByCommit = GitSupportsFetchingCommitBySha1Hash && !StringUtil.ConvertToBoolean(
+                executionContext.Variables.GetValueOrDefault("VSTS.DisableFetchByCommit")?.Value ??
+                System.Environment.GetEnvironmentVariable("VSTS_DISABLEFETCHBYCOMMIT"), false);
+
             executionContext.Debug($"repository url={repositoryUrl}");
             executionContext.Debug($"targetPath={targetPath}");
             executionContext.Debug($"sourceBranch={sourceBranch}");
@@ -274,27 +330,26 @@ namespace Agent.Plugins.Repository
             executionContext.Debug($"gitLfsSupport={gitLfsSupport}");
             executionContext.Debug($"acceptUntrustedCerts={acceptUntrustedCerts}");
 
-            bool preferGitFromPath;
-#if OS_WINDOWS
             bool schannelSslBackend = StringUtil.ConvertToBoolean(executionContext.Variables.GetValueOrDefault("agent.gituseschannel")?.Value);
             executionContext.Debug($"schannelSslBackend={schannelSslBackend}");
 
-            // Determine which git will be use
-            // On windows, we prefer the built-in portable git within the agent's externals folder, 
-            // set system.prefergitfrompath=true can change the behavior, agent will find git.exe from %PATH%
-            var definitionSetting = executionContext.Variables.GetValueOrDefault("system.prefergitfrompath");
-            if (definitionSetting != null)
+            // by default, find Git in the path
+            bool preferGitFromPath = true;
+
+            // On Windows, we prefer the built-in portable Git within the agent's externals folder,
+            // system.prefergitfrompath=true will cause the agent to find Git.exe from %PATH%
+            if (PlatformUtil.RunningOnWindows)
             {
-                preferGitFromPath = StringUtil.ConvertToBoolean(definitionSetting.Value);
+                var definitionSetting = executionContext.Variables.GetValueOrDefault("system.prefergitfrompath");
+                if (definitionSetting != null)
+                {
+                    preferGitFromPath = StringUtil.ConvertToBoolean(definitionSetting.Value);
+                }
+                else
+                {
+                    bool.TryParse(Environment.GetEnvironmentVariable("system.prefergitfrompath"), out preferGitFromPath);
+                }
             }
-            else
-            {
-                bool.TryParse(Environment.GetEnvironmentVariable("system.prefergitfrompath"), out preferGitFromPath);
-            }
-#else
-            // On Linux, we will always use git find in %PATH% regardless of system.prefergitfrompath
-            preferGitFromPath = true;
-#endif
 
             // Determine do we need to provide creds to git operation
             selfManageGitCreds = StringUtil.ConvertToBoolean(executionContext.Variables.GetValueOrDefault("system.selfmanagegitcreds")?.Value);
@@ -425,29 +480,30 @@ namespace Agent.Plugins.Repository
                         askPass.Add($"echo \"{agentCert.ClientCertificatePassword}\"");
                         File.WriteAllLines(clientCertPrivateKeyAskPassFile, askPass);
 
-#if !OS_WINDOWS
-                        string toolPath = WhichUtil.Which("chmod", true);
-                        string argLine = $"775 {clientCertPrivateKeyAskPassFile}";
-                        executionContext.Command($"chmod {argLine}");
-
-                        var processInvoker = new ProcessInvoker(executionContext);
-                        processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs args) =>
+                        if (!PlatformUtil.RunningOnWindows)
                         {
-                            if (!string.IsNullOrEmpty(args.Data))
-                            {
-                                executionContext.Output(args.Data);
-                            }
-                        };
-                        processInvoker.ErrorDataReceived += (object sender, ProcessDataReceivedEventArgs args) =>
-                        {
-                            if (!string.IsNullOrEmpty(args.Data))
-                            {
-                                executionContext.Output(args.Data);
-                            }
-                        };
+                            string toolPath = WhichUtil.Which("chmod", true);
+                            string argLine = $"775 {clientCertPrivateKeyAskPassFile}";
+                            executionContext.Command($"chmod {argLine}");
 
-                        await processInvoker.ExecuteAsync(executionContext.Variables.GetValueOrDefault("system.defaultworkingdirectory")?.Value, toolPath, argLine, null, true, CancellationToken.None);
-#endif
+                            var processInvoker = new ProcessInvoker(executionContext);
+                            processInvoker.OutputDataReceived += (object sender, ProcessDataReceivedEventArgs args) =>
+                            {
+                                if (!string.IsNullOrEmpty(args.Data))
+                                {
+                                    executionContext.Output(args.Data);
+                                }
+                            };
+                            processInvoker.ErrorDataReceived += (object sender, ProcessDataReceivedEventArgs args) =>
+                            {
+                                if (!string.IsNullOrEmpty(args.Data))
+                                {
+                                    executionContext.Output(args.Data);
+                                }
+                            };
+
+                            await processInvoker.ExecuteAsync(executionContext.Variables.GetValueOrDefault("system.defaultworkingdirectory")?.Value, toolPath, argLine, null, true, CancellationToken.None);
+                        }
                     }
                 }
             }
@@ -479,7 +535,7 @@ namespace Agent.Plugins.Repository
             else
             {
                 // delete the index.lock file left by previous canceled build or any operation cause git.exe crash last time.
-                string lockFile = Path.Combine(targetPath, ".git\\index.lock");
+                string lockFile = Path.Combine(targetPath, ".git", "index.lock");
                 if (File.Exists(lockFile))
                 {
                     try
@@ -493,8 +549,8 @@ namespace Agent.Plugins.Repository
                     }
                 }
 
-                // delete the shallow.lock file left by previous canceled build or any operation cause git.exe crash last time.		
-                string shallowLockFile = Path.Combine(targetPath, ".git\\shallow.lock");
+                // delete the shallow.lock file left by previous canceled build or any operation cause git.exe crash last time.
+                string shallowLockFile = Path.Combine(targetPath, ".git", "shallow.lock");
                 if (File.Exists(shallowLockFile))
                 {
                     try
@@ -542,7 +598,7 @@ namespace Agent.Plugins.Repository
                             int exitCode_submoduleclean = await gitCommandManager.GitSubmoduleClean(executionContext, targetPath);
                             if (exitCode_submoduleclean != 0)
                             {
-                                executionContext.Debug($"'git submodule foreach git clean -ffdx' failed with exit code {exitCode_submoduleclean}\nFor futher investigation, manually run 'git submodule foreach git clean -ffdx' on repo root: {targetPath} after each build.");
+                                executionContext.Debug($"'git submodule foreach --recursive \"git clean -ffdx\"' failed with exit code {exitCode_submoduleclean}\nFor futher investigation, manually run 'git submodule foreach --recursive \"git clean -ffdx\"' on repo root: {targetPath} after each build.");
                                 softCleanSucceed = false;
                             }
                         }
@@ -552,7 +608,7 @@ namespace Agent.Plugins.Repository
                             int exitCode_submodulereset = await gitCommandManager.GitSubmoduleReset(executionContext, targetPath);
                             if (exitCode_submodulereset != 0)
                             {
-                                executionContext.Debug($"'git submodule foreach git reset --hard HEAD' failed with exit code {exitCode_submodulereset}\nFor futher investigation, manually run 'git submodule foreach git reset --hard HEAD' on repo root: {targetPath} after each build.");
+                                executionContext.Debug($"'git submodule foreach --recursive \"git reset --hard HEAD\"' failed with exit code {exitCode_submodulereset}\nFor futher investigation, manually run 'git submodule foreach --recursive \"git reset --hard HEAD\"' on repo root: {targetPath} after each build.");
                                 softCleanSucceed = false;
                             }
                         }
@@ -619,8 +675,8 @@ namespace Agent.Plugins.Repository
             List<string> additionalLfsFetchArgs = new List<string>();
             if (!selfManageGitCreds)
             {
-                // v2.9 git support provide auth header as cmdline arg. 
-                // as long 2.9 git exist, VSTS repo, TFS repo and Github repo will use this to handle auth challenge. 
+                // v2.9 git support provide auth header as cmdline arg.
+                // as long 2.9 git exist, VSTS repo, TFS repo and Github repo will use this to handle auth challenge.
                 if (gitSupportAuthHeader)
                 {
                     additionalFetchArgs.Add($"-c http.extraheader=\"AUTHORIZATION: {GenerateAuthHeader(executionContext, username, password)}\"");
@@ -689,14 +745,21 @@ namespace Agent.Plugins.Repository
                         additionalLfsFetchArgs.Add($"-c http.sslcert=\"{agentCert.ClientCertificateFile}\" -c http.sslkey=\"{agentCert.ClientCertificatePrivateKeyFile}\"");
                     }
                 }
-#if OS_WINDOWS
+
                 if (schannelSslBackend)
                 {
-                    executionContext.Debug("Use SChannel SslBackend for git fetch.");
-                    additionalFetchArgs.Add("-c http.sslbackend=\"schannel\"");
-                    additionalLfsFetchArgs.Add("-c http.sslbackend=\"schannel\"");
+                    if (PlatformUtil.RunningOnWindows)
+                    {
+                        executionContext.Debug("Use SChannel SslBackend for git fetch.");
+                        additionalFetchArgs.Add("-c http.sslbackend=\"schannel\"");
+                        additionalLfsFetchArgs.Add("-c http.sslbackend=\"schannel\"");
+                    }
+                    else
+                    {
+                        executionContext.Debug("SChannel requested. Ignored because this is not Windows.");
+                    }
                 }
-#endif
+
                 // Prepare gitlfs url for fetch and checkout
                 if (gitLfsSupport)
                 {
@@ -741,13 +804,33 @@ namespace Agent.Plugins.Repository
                 }
             }
 
-            // If this is a build for a pull request, then include
-            // the pull request reference as an additional ref.
             List<string> additionalFetchSpecs = new List<string>();
+            string refFetchedByCommit = null;
+
             if (IsPullRequest(sourceBranch))
             {
-                additionalFetchSpecs.Add("+refs/heads/*:refs/remotes/origin/*");
-                additionalFetchSpecs.Add(StringUtil.Format("+{0}:{1}", sourceBranch, GetRemoteRefName(sourceBranch)));
+                // Build a 'fetch-by-commit' refspec iff the server allows us to do so in the shallow fetch scenario
+                // Otherwise, fall back to fetch all branches and pull request ref
+                if (fetchDepth > 0 && fetchByCommit && !string.IsNullOrEmpty(sourceVersion))
+                {
+                    refFetchedByCommit = $"{_remoteRefsPrefix}{sourceVersion}";
+                    additionalFetchSpecs.Add($"+{sourceVersion}:{refFetchedByCommit}");
+                }
+                else
+                {
+                    additionalFetchSpecs.Add("+refs/heads/*:refs/remotes/origin/*");
+                    additionalFetchSpecs.Add($"+{sourceBranch}:{GetRemoteRefName(sourceBranch)}");
+                }
+            }
+            else
+            {
+                // Build a refspec iff the server allows us to fetch a specific commit in the shallow fetch scenario
+                // Otherwise, use the default fetch behavior (i.e. with no refspecs)
+                if (fetchDepth > 0 && fetchByCommit && !string.IsNullOrEmpty(sourceVersion))
+                {
+                    refFetchedByCommit = $"{_remoteRefsPrefix}{sourceVersion}";
+                    additionalFetchSpecs.Add($"+{sourceVersion}:{refFetchedByCommit}");
+                }
             }
 
             int exitCode_fetch = await gitCommandManager.GitFetch(executionContext, targetPath, "origin", fetchDepth, additionalFetchSpecs, string.Join(" ", additionalFetchArgs), cancellationToken);
@@ -758,13 +841,18 @@ namespace Agent.Plugins.Repository
 
             // Checkout
             // sourceToBuild is used for checkout
-            // if sourceBranch is a PR branch or sourceVersion is null, make sure branch name is a remote branch. we need checkout to detached head. 
+            // if sourceBranch is a PR branch or sourceVersion is null, make sure branch name is a remote branch. we need checkout to detached head.
             // (change refs/heads to refs/remotes/origin, refs/pull to refs/remotes/pull, or leave it as it when the branch name doesn't contain refs/...)
             // if sourceVersion provide, just use that for checkout, since when you checkout a commit, it will end up in detached head.
             cancellationToken.ThrowIfCancellationRequested();
             executionContext.Progress(80, "Starting checkout...");
             string sourcesToBuild;
-            if (IsPullRequest(sourceBranch) || string.IsNullOrEmpty(sourceVersion))
+
+            if (refFetchedByCommit != null)
+            {
+                sourcesToBuild = refFetchedByCommit;
+            }
+            else if (IsPullRequest(sourceBranch) || string.IsNullOrEmpty(sourceVersion))
             {
                 sourcesToBuild = GetRemoteRefName(sourceBranch);
             }
@@ -865,13 +953,19 @@ namespace Agent.Plugins.Repository
                             additionalSubmoduleUpdateArgs.Add($"-c http.{authorityUrl}.sslcert=\"{agentCert.ClientCertificateFile}\" -c http.{authorityUrl}.sslkey=\"{agentCert.ClientCertificatePrivateKeyFile}\"");
                         }
                     }
-#if OS_WINDOWS
+
                     if (schannelSslBackend)
                     {
-                        executionContext.Debug("Use SChannel SslBackend for git submodule update.");
-                        additionalSubmoduleUpdateArgs.Add("-c http.sslbackend=\"schannel\"");
+                        if (PlatformUtil.RunningOnWindows)
+                        {
+                            executionContext.Debug("Use SChannel SslBackend for git submodule update.");
+                            additionalSubmoduleUpdateArgs.Add("-c http.sslbackend=\"schannel\"");
+                        }
+                        else
+                        {
+                            executionContext.Debug("SChannel requested for Git submodule update. Ignored because this is not Windows.");
+                        }
                     }
-#endif                    
                 }
 
                 int exitCode_submoduleUpdate = await gitCommandManager.GitSubmoduleUpdate(executionContext, targetPath, fetchDepth, string.Join(" ", additionalSubmoduleUpdateArgs), checkoutNestedSubmodules, cancellationToken);

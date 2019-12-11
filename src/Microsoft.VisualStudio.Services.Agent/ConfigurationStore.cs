@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System.IO;
 using System.Runtime.Serialization;
@@ -23,6 +26,9 @@ namespace Microsoft.VisualStudio.Services.Agent
 
         [IgnoreDataMember]
         public bool IsHosted => !string.IsNullOrEmpty(NotificationPipeName) || !string.IsNullOrEmpty(NotificationSocketAddress);
+
+        [DataMember(EmitDefaultValue = false)]
+        public string Fingerprint { get; set; }
 
         [DataMember(EmitDefaultValue = false)]
         public string NotificationPipeName { get; set; }
@@ -64,6 +70,15 @@ namespace Microsoft.VisualStudio.Services.Agent
 
         [DataMember(EmitDefaultValue = false)]
         public string CollectionName { get; set; }
+
+        [DataMember(EmitDefaultValue = false)]
+        public string MonitorSocketAddress { get; set; }
+
+        [DataMember(EmitDefaultValue = false)]
+        public int EnvironmentId { get; set; }
+
+        [DataMember(EmitDefaultValue = false)]
+        public int EnvironmentVMResourceId { get; set; }
     }
 
     [DataContract]
@@ -79,10 +94,9 @@ namespace Microsoft.VisualStudio.Services.Agent
     [DataContract]
     public sealed class AgentRuntimeOptions
     {
-#if OS_WINDOWS
         [DataMember(EmitDefaultValue = false)]
+        /// <summary>Use SecureChannel (only valid on Windows)</summary>
         public bool GitUseSecureChannel { get; set; }
-#endif
     }
 
     [ServiceLocator(Default = typeof(ConfigurationStore))]

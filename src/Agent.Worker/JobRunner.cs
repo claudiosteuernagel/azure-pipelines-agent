@@ -1,3 +1,7 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Agent.Sdk;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
@@ -11,10 +15,6 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Net.Http;
-using System.Text;
-using System.IO.Compression;
-using Microsoft.VisualStudio.Services.Agent.Worker.Build;
-using System.Diagnostics;
 using Newtonsoft.Json.Linq;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
@@ -132,25 +132,35 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
                 // Set agent variables.
                 AgentSettings settings = HostContext.GetService<IConfigurationStore>().GetSettings();
-                jobContext.Variables.Set(Constants.Variables.Agent.Id, settings.AgentId.ToString(CultureInfo.InvariantCulture));
+                jobContext.SetVariable(Constants.Variables.Agent.Id, settings.AgentId.ToString(CultureInfo.InvariantCulture));
                 jobContext.SetVariable(Constants.Variables.Agent.HomeDirectory, HostContext.GetDirectory(WellKnownDirectory.Root), isFilePath: true);
-                jobContext.Variables.Set(Constants.Variables.Agent.JobName, message.JobDisplayName);
-                jobContext.Variables.Set(Constants.Variables.Agent.MachineName, Environment.MachineName);
-                jobContext.Variables.Set(Constants.Variables.Agent.Name, settings.AgentName);
-                jobContext.Variables.Set(Constants.Variables.Agent.OS, VarUtil.OS);
-                jobContext.Variables.Set(Constants.Variables.Agent.OSArchitecture, VarUtil.OSArchitecture);
+                jobContext.SetVariable(Constants.Variables.Agent.JobName, message.JobDisplayName);
+                jobContext.SetVariable(Constants.Variables.Agent.MachineName, Environment.MachineName);
+                jobContext.SetVariable(Constants.Variables.Agent.Name, settings.AgentName);
+                jobContext.SetVariable(Constants.Variables.Agent.OS, VarUtil.OS);
+                jobContext.SetVariable(Constants.Variables.Agent.OSArchitecture, VarUtil.OSArchitecture);
                 jobContext.SetVariable(Constants.Variables.Agent.RootDirectory, HostContext.GetDirectory(WellKnownDirectory.Work), isFilePath: true);
-#if OS_WINDOWS
-                jobContext.SetVariable(Constants.Variables.Agent.ServerOMDirectory, HostContext.GetDirectory(WellKnownDirectory.ServerOM), isFilePath: true);
-#else
-                jobContext.Variables.Set(Constants.Variables.Agent.AcceptTeeEula, settings.AcceptTeeEula.ToString());
-#endif
+                if (PlatformUtil.RunningOnWindows)
+                {
+                    jobContext.SetVariable(Constants.Variables.Agent.ServerOMDirectory, HostContext.GetDirectory(WellKnownDirectory.ServerOM), isFilePath: true);
+                }
+                if (!PlatformUtil.RunningOnWindows)
+                {
+                    jobContext.SetVariable(Constants.Variables.Agent.AcceptTeeEula, settings.AcceptTeeEula.ToString());
+                }
                 jobContext.SetVariable(Constants.Variables.Agent.WorkFolder, HostContext.GetDirectory(WellKnownDirectory.Work), isFilePath: true);
                 jobContext.SetVariable(Constants.Variables.System.WorkFolder, HostContext.GetDirectory(WellKnownDirectory.Work), isFilePath: true);
 
                 string toolsDirectory = HostContext.GetDirectory(WellKnownDirectory.Tools);
                 Directory.CreateDirectory(toolsDirectory);
                 jobContext.SetVariable(Constants.Variables.Agent.ToolsDirectory, toolsDirectory, isFilePath: true);
+
+                bool disableGitPrompt = jobContext.Variables.GetBoolean("VSTS_DISABLE_GIT_PROMPT") ?? StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("VSTS_DISABLE_GIT_PROMPT"), true);
+                if (disableGitPrompt &&
+                    string.IsNullOrEmpty(jobContext.Variables.Get("GIT_TERMINAL_PROMPT")))
+                {
+                    jobContext.SetVariable("GIT_TERMINAL_PROMPT", "0");
+                }
 
                 // Setup TEMP directories
                 _tempDirectoryManager = HostContext.GetService<ITempDirectoryManager>();
@@ -219,10 +229,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 }
 
                 // Expand container properties
-                jobContext.Container?.ExpandProperties(jobContext.Variables);
+                foreach (var container in jobContext.Containers)
+                {
+                    this.ExpandProperties(container, jobContext.Variables);
+                }
                 foreach (var sidecar in jobContext.SidecarContainers)
                 {
-                    sidecar.ExpandProperties(jobContext.Variables);
+                    this.ExpandProperties(sidecar, jobContext.Variables);
                 }
 
                 // Get the job extension.
@@ -323,6 +336,27 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             }
         }
 
+        public void ExpandProperties(ContainerInfo container, Variables variables)
+        {
+            // Expand port mapping
+            variables.ExpandValues(container.UserPortMappings);
+
+            // Expand volume mounts
+            variables.ExpandValues(container.UserMountVolumes);
+            foreach (var volume in container.UserMountVolumes.Values)
+            {
+                // After mount volume variables are expanded, they are final
+                container.MountVolumes.Add(new MountVolume(volume));
+            }
+
+            // Expand env vars
+            variables.ExpandValues(container.ContainerEnvironmentVariables);
+
+            // Expand image and options strings
+            container.ContainerImage = variables.ExpandValue(nameof(container.ContainerImage), container.ContainerImage);
+            container.ContainerCreateOptions = variables.ExpandValue(nameof(container.ContainerCreateOptions), container.ContainerCreateOptions);
+        }
+
         private async Task<TaskResult> CompleteJobAsync(IJobServer jobServer, IExecutionContext jobContext, Pipelines.AgentJobRequestMessage message, TaskResult? taskResult = null)
         {
             jobContext.Section(StringUtil.Loc("StepFinishing", message.JobDisplayName));
@@ -412,8 +446,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         // the scheme://hostname:port (how the agent knows the server) is external to our server
         // in other words, an agent may have it's own way (DNS, hostname) of refering
         // to the server.  it owns that.  That's the scheme://hostname:port we will use.
-        // Example: Server's notification url is http://tfsserver:8080/tfs 
-        //          Agent config url is https://tfsserver.mycompany.com:9090/tfs 
+        // Example: Server's notification url is http://tfsserver:8080/tfs
+        //          Agent config url is https://tfsserver.mycompany.com:9090/tfs
         private Uri ReplaceWithConfigUriBase(Uri messageUri)
         {
             AgentSettings settings = HostContext.GetService<IConfigurationStore>().GetSettings();

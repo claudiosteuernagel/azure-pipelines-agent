@@ -1,3 +1,7 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Agent.Sdk;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -6,7 +10,6 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.TeamFoundation.DistributedTask.Orchestration.Server.Pipelines.Yaml;
@@ -499,12 +502,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             // Resolve the location of git.
             if (_gitPath == null)
             {
-#if OS_WINDOWS
-                _gitPath = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), "git", "cmd", $"git{IOUtil.ExeExtension}");
-                ArgUtil.File(_gitPath, nameof(_gitPath));
-#else
-                _gitPath = WhichUtil.Which("git", require: true);
-#endif
+                if (PlatformUtil.RunningOnWindows)
+                {
+                    _gitPath = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), "git", "cmd", $"git{IOUtil.ExeExtension}");
+                    ArgUtil.File(_gitPath, nameof(_gitPath));
+                }
+                else
+                {
+                    _gitPath = WhichUtil.Which("git", require: true);
+                }
             }
 
             // Prepare the environment variables to overlay.
@@ -512,9 +518,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             overlayEnvironment["GIT_TERMINAL_PROMPT"] = "0";
             // Skip any GIT_TRACE variable since GIT_TRACE will affect ouput from every git command.
             // This will fail the parse logic for detect git version, remote url, etc.
-            // Ex. 
+            // Ex.
             //      SET GIT_TRACE=true
-            //      git version 
+            //      git version
             //      11:39:58.295959 git.c:371               trace: built-in: git 'version'
             //      git version 2.11.1.windows.1
             IDictionary currentEnvironment = Environment.GetEnvironmentVariables();
@@ -543,11 +549,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 output.AppendLine(message.Data);
                 Console.WriteLine(message.Data);
             };
-#if OS_WINDOWS
-            Encoding encoding = Encoding.UTF8;
-#else
             Encoding encoding = null;
-#endif
+            if (PlatformUtil.RunningOnWindows)
+            {
+                encoding = Encoding.UTF8;
+            }
             await processInvoker.ExecuteAsync(
                 workingDirectory: Directory.GetCurrentDirectory(),
                 fileName: _gitPath,
@@ -685,7 +691,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 // Inform the user that a download is taking place. The download could take a while if
                 // the task zip is large. It would be nice to print the localized name, but it is not
                 // available from the reference included in the job message.
-                _term.WriteLine(StringUtil.Loc("DownloadingTask0", task.Name));
+                _term.WriteLine(StringUtil.Loc("DownloadingTask0", task.Name, task.Version));
                 string zipFile;
                 var version = new TaskVersion(task.Version);
 
@@ -700,7 +706,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                     {
                         using (Stream result = await HttpClient.GetTaskContentZipAsync(task.Id, version, token))
                         {
-                            //81920 is the default used by System.IO.Stream.CopyTo and is under the large object heap threshold (85k). 
+                            //81920 is the default used by System.IO.Stream.CopyTo and is under the large object heap threshold (85k).
                             await result.CopyToAsync(fs, 81920, token);
                             await fs.FlushAsync(token);
                         }

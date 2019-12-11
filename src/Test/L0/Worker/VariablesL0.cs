@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.Agent.Worker;
@@ -749,6 +752,70 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker
 
                 // Assert.
                 Assert.Equal("bar", variables.Get("foo"));
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void Unset()
+        {
+            using (TestHostContext hc = new TestHostContext(this))
+            {
+                List<string> warnings;
+                var variables = new Variables(hc, new Dictionary<string, VariableValue>(), out warnings);
+
+                variables.Set("foo", "bar");
+
+                Assert.Equal("bar", variables.Get("foo"));
+                variables.Unset("foo");
+                Assert.Equal(null, variables.Get("foo"));
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void Scope()
+        {
+            using (TestHostContext hc = new TestHostContext(this))
+            {
+                List<string> warnings;
+                var variables = new Variables(hc, new Dictionary<string, VariableValue>(), out warnings);
+                var scope = variables.CreateScope();
+                scope.Set("foo", "bar");
+
+                Assert.Equal("bar", variables.Get("foo"));
+                scope.Dispose();
+                Assert.Equal(null, variables.Get("foo"));
+            }
+        }
+
+        public void CopyInto_Basic()
+        {
+            using (TestHostContext hc = new TestHostContext(this))
+            {
+                // Arrange.
+                List<string> warnings;
+                var variables = new Variables(hc, new Dictionary<string, VariableValue>(), out warnings);
+                
+                
+                Dictionary<string,VariableValue> dict1 = new Dictionary<string, VariableValue>();
+                variables.CopyInto(dict1);
+                
+                Assert.Equal(0, dict1.Count);
+
+                variables.Set("foo", "bar");
+                variables.CopyInto(dict1);
+                Assert.Equal(1, dict1.Count);
+                Assert.Equal("bar", dict1["foo"]);
+
+                variables.Set("boo", "bah", true);
+                variables.CopyInto(dict1);
+                Assert.Equal(2, dict1.Count);
+                Assert.Equal("bar", dict1["foo"]);
+                Assert.Equal(new VariableValue("bah", true), dict1["boo"]);
+
             }
         }
     }

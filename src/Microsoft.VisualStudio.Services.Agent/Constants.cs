@@ -1,4 +1,8 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using System;
+using Agent.Sdk;
 
 namespace Microsoft.VisualStudio.Services.Agent
 {
@@ -17,8 +21,10 @@ namespace Microsoft.VisualStudio.Services.Agent
         Root,
         ServerOM,
         Tasks,
+        TaskZips,
         Tee,
         Temp,
+        Tf,
         Tools,
         Update,
         Work,
@@ -41,55 +47,25 @@ namespace Microsoft.VisualStudio.Services.Agent
 
     public static class Constants
     {
-        /// <summary>Path environment varible name.</summary>
-#if OS_WINDOWS
-        public static readonly string PathVariable = "Path";
-#else
-        public static readonly string PathVariable = "PATH";
-#endif
+        /// <summary>Name of environment variable holding the path.</summary>
+        public static string PathVariable
+        {
+            get => 
+                PlatformUtil.RunningOnWindows
+                ? "Path"
+                : "PATH";
+        }
         public static string TFBuild = "TF_BUILD";
         public static string ProcessLookupId = "VSTS_PROCESS_LOOKUP_ID";
         public static string PluginTracePrefix = "##[plugin.trace]";
+        public static readonly int AgentDownloadRetryMaxAttempts = 3;
 
-        // This enum is embedded within the Constants class to make it easier to reference and avoid
-        // ambiguous type reference with System.Runtime.InteropServices.OSPlatform and System.Runtime.InteropServices.Architecture
-        public enum OSPlatform
-        {
-            OSX,
-            Linux,
-            Windows
-        }
-
-        public enum Architecture
-        {
-            X86,
-            X64,
-            Arm,
-            Arm64
-        }
+        // Environment variable set on hosted Azure Pipelines images to
+        // store the version of the image
+        public static readonly string ImageVersionVariable = "ImageVersion";
 
         public static class Agent
         {
-            public static readonly string Version = "2.144.0";
-
-#if OS_LINUX
-            public static readonly OSPlatform Platform = OSPlatform.Linux;
-#elif OS_OSX
-            public static readonly OSPlatform Platform = OSPlatform.OSX;
-#elif OS_WINDOWS
-            public static readonly OSPlatform Platform = OSPlatform.Windows;
-#endif
-
-#if X86
-            public static readonly Architecture PlatformArchitecture = Architecture.X86;
-#elif X64
-            public static readonly Architecture PlatformArchitecture = Architecture.X64;
-#elif ARM
-            public static readonly Architecture PlatformArchitecture = Architecture.Arm;
-#elif ARM64            
-            public static readonly Architecture PlatformArchitecture = Architecture.Arm64;
-#endif
-
             public static readonly TimeSpan ExitOnUnloadTimeout = TimeSpan.FromSeconds(30);
 
             public static class CommandLine
@@ -104,9 +80,12 @@ namespace Microsoft.VisualStudio.Services.Agent
                     public static readonly string DeploymentGroupName = "deploymentgroupname";
                     public static readonly string DeploymentPoolName = "deploymentpoolname";
                     public static readonly string DeploymentGroupTags = "deploymentgrouptags";
+                    public static readonly string EnvironmentName = "environmentname";
+                    public static readonly string EnvironmentVMResourceTags = "virtualmachineresourcetags";
                     public static readonly string MachineGroupName = "machinegroupname";
                     public static readonly string MachineGroupTags = "machinegrouptags";
                     public static readonly string Matrix = "matrix";
+                    public static readonly string MonitorSocketAddress = "monitorsocketaddress";
                     public static readonly string NotificationPipeName = "notificationpipename";
                     public static readonly string NotificationSocketAddress = "notificationsocketaddress";
                     public static readonly string Phase = "phase";
@@ -157,9 +136,11 @@ namespace Microsoft.VisualStudio.Services.Agent
                     public static readonly string AcceptTeeEula = "acceptteeeula";
                     public static readonly string AddDeploymentGroupTags = "adddeploymentgrouptags";
                     public static readonly string AddMachineGroupTags = "addmachinegrouptags";
+                    public static readonly string AddEnvironmentVirtualMachineResourceTags = "addvirtualmachineresourcetags";
                     public static readonly string Commit = "commit";
                     public static readonly string DeploymentGroup = "deploymentgroup";
                     public static readonly string DeploymentPool = "deploymentpool";
+                    public static readonly string Environment = "environment";
                     public static readonly string OverwriteAutoLogon = "overwriteautologon";
                     public static readonly string GitUseSChannel = "gituseschannel";
                     public static readonly string Help = "help";
@@ -167,6 +148,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                     public static readonly string Replace = "replace";
                     public static readonly string NoRestart = "norestart";
                     public static readonly string LaunchBrowser = "launchbrowser";
+                    public static readonly string Once = "once";
                     public static readonly string RunAsAutoLogon = "runasautologon";
                     public static readonly string RunAsService = "runasservice";
                     public static readonly string SslSkipCertValidation = "sslskipcertvalidation";
@@ -182,6 +164,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public const int TerminatedError = 1;
                 public const int RetryableError = 2;
                 public const int AgentUpdating = 3;
+                public const int RunOnceAgentUpdating = 4;
             }
 
             public static class AgentConfigurationProvider
@@ -189,6 +172,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public static readonly string BuildReleasesAgentConfiguration = "BuildReleasesAgentConfiguration";
                 public static readonly string DeploymentAgentConfiguration = "DeploymentAgentConfiguration";
                 public static readonly string SharedDeploymentAgentConfiguration = "SharedDeploymentAgentConfiguration";
+                public static readonly string EnvironmentVMResourceConfiguration = "EnvironmentVMResourceConfiguration";
             }
         }
 
@@ -251,9 +235,11 @@ namespace Microsoft.VisualStudio.Services.Agent
             public static readonly string ServerOMDirectory = "vstsom";
             public static readonly string TempDirectory = "_temp";
             public static readonly string TeeDirectory = "tee";
+            public static readonly string TfDirectory = "tf";
             public static readonly string ToolDirectory = "_tool";
             public static readonly string TaskJsonFile = "task.json";
             public static readonly string TasksDirectory = "_tasks";
+            public static readonly string TaskZipsDirectory = "_taskzips";
             public static readonly string UpdateDirectory = "_update";
             public static readonly string WorkDirectory = "_work";
         }
@@ -369,6 +355,11 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public static readonly string SkipSyncSource = "agent.source.skip";
             }
 
+            public static class Pipeline
+            {
+                public static readonly string Workspace = "pipeline.workspace";
+            }
+
             public static class Release
             {
                 //
@@ -409,10 +400,18 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public static readonly string DefinitionId = "system.definitionid";
                 public static readonly string EnableAccessToken = "system.enableAccessToken";
                 public static readonly string HostType = "system.hosttype";
+                public static readonly string JobAttempt = "system.jobAttempt";
+                public static readonly string JobId = "system.jobId";
+                public static readonly string JobName = "system.jobName";
+                public static readonly string PhaseAttempt = "system.phaseAttempt";
                 public static readonly string PhaseDisplayName = "system.phaseDisplayName";
+                public static readonly string PhaseName = "system.phaseName";
                 public static readonly string PreferGitFromPath = "system.prefergitfrompath";
+                public static readonly string PullRequestTargetBranchName = "system.pullrequest.targetbranch";
                 public static readonly string SelfManageGitCreds = "system.selfmanagegitcreds";
                 public static readonly string ServerType = "system.servertype";
+                public static readonly string StageAttempt = "system.stageAttempt";
+                public static readonly string StageName = "system.stageName";
                 public static readonly string TFServerUrl = "system.TeamFoundationServerUri"; // back compat variable, do not document
                 public static readonly string TeamProject = "system.teamproject";
                 public static readonly string TeamProjectId = "system.teamProjectId";

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Moq;
 using System;
@@ -100,7 +103,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.LogPluginHost
             public async Task ProcessLineAsync(IAgentLogPluginContext context, Pipelines.TaskStepDefinitionReference step, string line)
             {
                 context.Output("BLOCK");
-                await Task.Delay(-1);
+                await Task.Delay(TimeSpan.FromMilliseconds(-1));
             }
         }
 
@@ -295,12 +298,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.LogPluginHost
                 logPluginHost.Finish();
                 await task;
 
-                Assert.True(trace.Outputs.Contains("Test1: 0"));
-                Assert.True(trace.Outputs.Contains("Test1: 999"));
-                Assert.True(trace.Outputs.Contains("Test1: Done"));
-                Assert.True(trace.Outputs.Contains("Test2: 0"));
-                Assert.True(trace.Outputs.Contains("Test2: 999"));
-                Assert.True(trace.Outputs.Contains("Test2: Done"));
+                foreach (var fragment in new string[] { "Test1: 0", "Test1: 999", "Test1: Done", "Test2: 0", "Test2: 999", "Test2: Done"})
+                {
+                    Assert.True(trace.Outputs.Contains(fragment), $"Found '{fragment}' in: {trace.Outputs}");
+                }
             }
         }
 
@@ -355,7 +356,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.LogPluginHost
                     logPluginHost.EnqueueOutput($"{Guid.Empty.ToString("D")}:{i}");
                 }
 
-                await Task.Delay(1000);
+                await Task.Delay(2000);
                 logPluginHost.Finish();
                 await task;
 
@@ -470,7 +471,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.LogPluginHost
                 Assert.True(trace.Outputs.Contains("TestException: Done"));
             }
         }
-        
+
         // potential bug in XUnit cause the test failure.
         // [Fact]
         // [Trait("Level", "L0")]

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using System;
 using System.Collections.Generic;
@@ -70,9 +73,16 @@ namespace Microsoft.VisualStudio.Services.Agent
                 return;
             }
 
-            _genericConnection = await EstablishVssConnection(serverUrl, credentials, TimeSpan.FromSeconds(100));
-            _messageConnection = await EstablishVssConnection(serverUrl, credentials, TimeSpan.FromSeconds(60));
-            _requestConnection = await EstablishVssConnection(serverUrl, credentials, TimeSpan.FromSeconds(60));
+            // Perf: Kick off these 3 outbound calls in parallel and wait for all of them to finish.
+            Task<VssConnection> task1 = EstablishVssConnection(serverUrl, credentials, TimeSpan.FromSeconds(60));
+            Task<VssConnection> task2 = EstablishVssConnection(serverUrl, credentials, TimeSpan.FromSeconds(60));
+            Task<VssConnection> task3 = EstablishVssConnection(serverUrl, credentials, TimeSpan.FromSeconds(60));
+
+            await Task.WhenAll(task1, task2, task3);
+
+            _genericConnection = task1.Result;
+            _messageConnection = task2.Result;
+            _requestConnection = task3.Result;
 
             _genericTaskAgentClient = _genericConnection.GetClient<TaskAgentHttpClient>();
             _messageTaskAgentClient = _messageConnection.GetClient<TaskAgentHttpClient>();
@@ -83,31 +93,76 @@ namespace Microsoft.VisualStudio.Services.Agent
             _hasRequestConnection = true;
         }
 
+        // Refresh connection is best effort. it should never throw exception
         public async Task RefreshConnectionAsync(AgentConnectionType connectionType, TimeSpan timeout)
         {
             Trace.Info($"Refresh {connectionType} VssConnection to get on a different AFD node.");
+            VssConnection newConnection = null;
             switch (connectionType)
             {
                 case AgentConnectionType.MessageQueue:
-                    _hasMessageConnection = false;
-                    _messageConnection = await EstablishVssConnection(_messageConnection.Uri, _messageConnection.Credentials, timeout);
-                    _messageTaskAgentClient = _messageConnection.GetClient<TaskAgentHttpClient>();
-                    _hasMessageConnection = true;
+                    try
+                    {
+                        _hasMessageConnection = false;
+                        newConnection = await EstablishVssConnection(_messageConnection.Uri, _messageConnection.Credentials, timeout);
+                        var client = newConnection.GetClient<TaskAgentHttpClient>();
+                        _messageConnection = newConnection;
+                        _messageTaskAgentClient = client;
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Error($"Catch exception during reset {connectionType} connection.");
+                        Trace.Error(ex);
+                        newConnection?.Dispose();
+                    }
+                    finally
+                    {
+                        _hasMessageConnection = true;
+                    }
                     break;
                 case AgentConnectionType.JobRequest:
-                    _hasRequestConnection = false;
-                    _requestConnection = await EstablishVssConnection(_requestConnection.Uri, _requestConnection.Credentials, timeout);
-                    _requestTaskAgentClient = _requestConnection.GetClient<TaskAgentHttpClient>();
-                    _hasRequestConnection = true;
+                    try
+                    {
+                        _hasRequestConnection = false;
+                        newConnection = await EstablishVssConnection(_requestConnection.Uri, _requestConnection.Credentials, timeout);
+                        var client = newConnection.GetClient<TaskAgentHttpClient>();
+                        _requestConnection = newConnection;
+                        _requestTaskAgentClient = client;
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Error($"Catch exception during reset {connectionType} connection.");
+                        Trace.Error(ex);
+                        newConnection?.Dispose();
+                    }
+                    finally
+                    {
+                        _hasRequestConnection = true;
+                    }
                     break;
                 case AgentConnectionType.Generic:
-                    _hasGenericConnection = false;
-                    _genericConnection = await EstablishVssConnection(_genericConnection.Uri, _genericConnection.Credentials, timeout);
-                    _genericTaskAgentClient = _genericConnection.GetClient<TaskAgentHttpClient>();
-                    _hasGenericConnection = true;
+                    try
+                    {
+                        _hasGenericConnection = false;
+                        newConnection = await EstablishVssConnection(_genericConnection.Uri, _genericConnection.Credentials, timeout);
+                        var client = newConnection.GetClient<TaskAgentHttpClient>();
+                        _genericConnection = newConnection;
+                        _genericTaskAgentClient = client;
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Error($"Catch exception during reset {connectionType} connection.");
+                        Trace.Error(ex);
+                        newConnection?.Dispose();
+                    }
+                    finally
+                    {
+                        _hasGenericConnection = true;
+                    }
                     break;
                 default:
-                    throw new NotSupportedException(connectionType.ToString());
+                    Trace.Error($"Unexpected connection type: {connectionType}.");
+                    break;
             }
         }
 
@@ -126,7 +181,8 @@ namespace Microsoft.VisualStudio.Services.Agent
                     _genericConnection.Settings.SendTimeout = timeout;
                     break;
                 default:
-                    throw new NotSupportedException(connectionType.ToString());
+                    Trace.Error($"Unexpected connection type: {connectionType}.");
+                    break;
             }
         }
 

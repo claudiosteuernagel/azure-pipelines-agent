@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -35,7 +38,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
         private readonly Dictionary<string, PluginInfo> _logPlugins = new Dictionary<string, PluginInfo>()
         {
-            //{"SampleLogPlugin",  new PluginInfo("Agent.Plugins.Log.SampleLogPlugin, Agent.Plugins", "Re-save Log")},
+            {"TestResultLogPlugin",  new PluginInfo("Agent.Plugins.Log.TestResultParser.Plugin.TestResultLogPlugin, Agent.Plugins", "Test Result Parser plugin")},
+            {"TestFilePublisherPlugin",  new PluginInfo("Agent.Plugins.Log.TestFilePublisher.TestFilePublisherLogPlugin, Agent.Plugins", "Test File Publisher plugin")}
         };
 
         private class PluginInfo
@@ -116,6 +120,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                                                              outputEncoding: Encoding.UTF8,
                                                              killProcessOnCancel: true,
                                                              redirectStandardIn: _redirectedStdin,
+                                                             inheritConsoleHandler: false,
+                                                             keepStandardInOpen: true,
                                                              cancellationToken: token);
 
                 // construct plugin context
@@ -132,14 +138,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 pluginContext.PluginAssemblies.AddRange(_logPlugins.Values.Select(x => x.AssemblyName));
 
                 // variables
-                foreach (var publicVar in context.Variables.Public)
-                {
-                    pluginContext.Variables[publicVar.Key] = publicVar.Value;
-                }
-                foreach (var privateVar in context.Variables.Private)
-                {
-                    pluginContext.Variables[privateVar.Key] = new VariableValue(privateVar.Value, true);
-                }
+                context.Variables.CopyInto(pluginContext.Variables);
 
                 // steps
                 foreach (var step in steps)

@@ -1,10 +1,12 @@
-﻿using Microsoft.VisualStudio.Services.Agent.Listener.Configuration;
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Microsoft.VisualStudio.Services.Agent.Listener.Configuration;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
-using Microsoft.TeamFoundation.DistributedTask.Logging;
 
 namespace Microsoft.VisualStudio.Services.Agent.Listener
 {
@@ -32,9 +34,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             Constants.Agent.CommandLine.Flags.Commit,
             Constants.Agent.CommandLine.Flags.DeploymentGroup,
             Constants.Agent.CommandLine.Flags.DeploymentPool,
-#if OS_WINDOWS
+            Constants.Agent.CommandLine.Flags.Environment,
+            // SChannel is Windows-only
             Constants.Agent.CommandLine.Flags.GitUseSChannel,
-#endif
             Constants.Agent.CommandLine.Flags.Help,
             Constants.Agent.CommandLine.Flags.MachineGroup,
             Constants.Agent.CommandLine.Flags.NoRestart,
@@ -42,6 +44,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             Constants.Agent.CommandLine.Flags.Replace,
             Constants.Agent.CommandLine.Flags.RunAsAutoLogon,
             Constants.Agent.CommandLine.Flags.RunAsService,
+            Constants.Agent.CommandLine.Flags.Once,
             Constants.Agent.CommandLine.Flags.SslSkipCertValidation,
             Constants.Agent.CommandLine.Flags.Unattended,
             Constants.Agent.CommandLine.Flags.Version,
@@ -56,9 +59,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             Constants.Agent.CommandLine.Args.DeploymentGroupName,
             Constants.Agent.CommandLine.Args.DeploymentPoolName,
             Constants.Agent.CommandLine.Args.DeploymentGroupTags,
+            Constants.Agent.CommandLine.Args.EnvironmentName,
+            Constants.Agent.CommandLine.Args.EnvironmentVMResourceTags,
             Constants.Agent.CommandLine.Args.MachineGroupName,
             Constants.Agent.CommandLine.Args.MachineGroupTags,
             Constants.Agent.CommandLine.Args.Matrix,
+            Constants.Agent.CommandLine.Args.MonitorSocketAddress,
             Constants.Agent.CommandLine.Args.NotificationPipeName,
             Constants.Agent.CommandLine.Args.Password,
             Constants.Agent.CommandLine.Args.Phase,
@@ -96,10 +102,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
         public bool Version => TestFlag(Constants.Agent.CommandLine.Flags.Version);
         public bool DeploymentGroup => TestFlag(Constants.Agent.CommandLine.Flags.MachineGroup) || TestFlag(Constants.Agent.CommandLine.Flags.DeploymentGroup);
         public bool DeploymentPool => TestFlag(Constants.Agent.CommandLine.Flags.DeploymentPool);
+        public bool EnvironmentVMResource => TestFlag(Constants.Agent.CommandLine.Flags.Environment);
         public bool WhatIf => TestFlag(Constants.Agent.CommandLine.Flags.WhatIf);
-#if OS_WINDOWS
         public bool GitUseSChannel => TestFlag(Constants.Agent.CommandLine.Flags.GitUseSChannel);
-#endif
+        public bool RunOnce => TestFlag(Constants.Agent.CommandLine.Flags.Once);
+
         // Constructor.
         public CommandSettings(IHostContext context, string[] args)
         {
@@ -359,6 +366,45 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             return result;
         }
 
+        // Environments
+
+        public string GetEnvironmentName()
+        {
+            var result = GetArg(Constants.Agent.CommandLine.Args.EnvironmentName);
+            if (string.IsNullOrEmpty(result))
+            {
+                return GetArgOrPrompt(
+                    name: Constants.Agent.CommandLine.Args.EnvironmentName,
+                    description: StringUtil.Loc("EnvironmentName"),
+                    defaultValue: string.Empty,
+                    validator: Validators.NonEmptyValidator);
+            }
+            return result;
+        }
+
+        public bool GetEnvironmentVirtualMachineResourceTagsRequired()
+        {
+            return TestFlag(Constants.Agent.CommandLine.Flags.AddEnvironmentVirtualMachineResourceTags)
+                   || TestFlagOrPrompt(
+                           name: Constants.Agent.CommandLine.Flags.AddEnvironmentVirtualMachineResourceTags,
+                           description: StringUtil.Loc("AddEnvironmentVMResourceTags"),
+                           defaultValue: false);
+        }
+
+        public string GetEnvironmentVirtualMachineResourceTags()
+        {
+            var result = GetArg(Constants.Agent.CommandLine.Args.EnvironmentVMResourceTags);
+            if (string.IsNullOrEmpty(result))
+            {
+                return GetArgOrPrompt(
+                    name: Constants.Agent.CommandLine.Args.EnvironmentVMResourceTags,
+                    description: StringUtil.Loc("EnvironmentVMResourceTags"),
+                    defaultValue: string.Empty,
+                    validator: Validators.NonEmptyValidator);
+            }
+            return result;
+        }
+
         public string GetUserName()
         {
             return GetArgOrPrompt(
@@ -393,6 +439,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 description: StringUtil.Loc("WorkFolderDescription"),
                 defaultValue: Constants.Path.WorkDirectory,
                 validator: Validators.NonEmptyValidator);
+        }
+
+        public string GetMonitorSocketAddress()
+        {
+            return GetArg(Constants.Agent.CommandLine.Args.MonitorSocketAddress);
         }
 
         public string GetNotificationPipeName()
@@ -508,7 +559,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             if (!string.IsNullOrEmpty(result))
             {
                 // After read the arg from input commandline args, remove it from Arg dictionary,
-                // This will help if bad arg value passed through CommandLine arg, when ConfigurationManager ask CommandSetting the second time, 
+                // This will help if bad arg value passed through CommandLine arg, when ConfigurationManager ask CommandSetting the second time,
                 // It will prompt for input instead of continue use the bad input.
                 _trace.Info($"Remove {name} from Arg dictionary.");
                 RemoveArg(name);

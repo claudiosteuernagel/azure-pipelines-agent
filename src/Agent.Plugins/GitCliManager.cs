@@ -1,5 +1,9 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -9,16 +13,19 @@ using System.IO;
 using Agent.Sdk;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.Common;
+using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 
 namespace Agent.Plugins.Repository
 {
     public class GitCliManager
     {
-#if OS_WINDOWS
-        private static readonly Encoding s_encoding = Encoding.UTF8;
-#else
-        private static readonly Encoding s_encoding = null;
-#endif
+        private static Encoding _encoding
+        {
+            get => PlatformUtil.RunningOnWindows
+                ? Encoding.UTF8
+                : null;
+        }
+
         private readonly Dictionary<string, string> gitEnv = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             { "GIT_TERMINAL_PROMPT", "0" },
@@ -71,10 +78,12 @@ namespace Agent.Plugins.Repository
 
         public async Task LoadGitExecutionInfo(AgentTaskPluginExecutionContext context, bool useBuiltInGit)
         {
+            // There is no built-in git for OSX/Linux
+            gitPath = null;
+
             // Resolve the location of git.
-            if (useBuiltInGit)
+            if (useBuiltInGit && PlatformUtil.RunningOnWindows)
             {
-#if OS_WINDOWS
                 string agentHomeDir = context.Variables.GetValueOrDefault("agent.homedirectory")?.Value;
                 ArgUtil.NotNullOrEmpty(agentHomeDir, nameof(agentHomeDir));
                 gitPath = Path.Combine(agentHomeDir, "externals", "git", "cmd", $"git.exe");
@@ -83,10 +92,6 @@ namespace Agent.Plugins.Repository
                 context.Output(StringUtil.Loc("Prepending0WithDirectoryContaining1", "Path", Path.GetFileName(gitPath)));
                 context.PrependPath(Path.GetDirectoryName(gitPath));
                 context.Debug($"PATH: '{Environment.GetEnvironmentVariable("PATH")}'");
-#else
-                // There is no built-in git for OSX/Linux
-                gitPath = null;
-#endif
             }
             else
             {
@@ -95,7 +100,7 @@ namespace Agent.Plugins.Repository
 
             ArgUtil.File(gitPath, nameof(gitPath));
 
-            // Get the Git version.    
+            // Get the Git version.
             gitVersion = await GitVersion(context);
             ArgUtil.NotNull(gitVersion, nameof(gitVersion));
             context.Debug($"Detect git version: {gitVersion.ToString()}.");
@@ -123,6 +128,16 @@ namespace Agent.Plugins.Repository
                 context.Output(StringUtil.Loc("UpgradeToLatestGit", recommendGitVersion, gitVersion));
             }
 
+            // git-lfs 2.7.1 contains a bug where it doesn't include extra header from git config
+            // See https://github.com/git-lfs/git-lfs/issues/3571
+            bool gitLfsSupport = StringUtil.ConvertToBoolean(context.GetInput(Pipelines.PipelineConstants.CheckoutTaskInputs.Lfs));
+            Version recommendedGitLfsVersion = new Version(2, 7, 2);
+
+            if (gitLfsSupport && gitLfsVersion == new Version(2, 7, 1))
+            {
+                context.Output(StringUtil.Loc("UnsupportedGitLfsVersion", gitLfsVersion, recommendedGitLfsVersion));
+            }
+
             // Set the user agent.
             string gitHttpUserAgentEnv = $"git/{gitVersion.ToString()} (vsts-agent-git/{context.Variables.GetValueOrDefault("agent.version")?.Value ?? "unknown"})";
             context.Debug($"Set git useragent to: {gitHttpUserAgentEnv}.");
@@ -146,21 +161,34 @@ namespace Agent.Plugins.Repository
                 refSpec = refSpec.Where(r => !string.IsNullOrEmpty(r)).ToList();
             }
 
+            // Git 2.20 changed its fetch behavior, rejecting tag updates if the --force flag is not provided
+            // See https://git-scm.com/docs/git-fetch for more details
+            string forceTag = string.Empty;
+
+            if (gitVersion >= new Version(2, 20))
+            {
+                forceTag = "--force";
+            }
+
+            bool reducedOutput = StringUtil.ConvertToBoolean(
+                context.Variables.GetValueOrDefault("agent.source.checkout.quiet")?.Value);
+            string progress = reducedOutput ? string.Empty : "--progress";
+
             // default options for git fetch.
-            string options = StringUtil.Format($"--tags --prune --progress --no-recurse-submodules {remoteName} {string.Join(" ", refSpec)}");
+            string options = StringUtil.Format($"{forceTag} --tags --prune {progress} --no-recurse-submodules {remoteName} {string.Join(" ", refSpec)}");
 
             // If shallow fetch add --depth arg
             // If the local repository is shallowed but there is no fetch depth provide for this build,
             // add --unshallow to convert the shallow repository to a complete repository
             if (fetchDepth > 0)
             {
-                options = StringUtil.Format($"--tags --prune --progress --no-recurse-submodules --depth={fetchDepth} {remoteName} {string.Join(" ", refSpec)}");
+                options = StringUtil.Format($"{forceTag} --tags --prune {progress} --no-recurse-submodules --depth={fetchDepth} {remoteName} {string.Join(" ", refSpec)}");
             }
             else
             {
                 if (File.Exists(Path.Combine(repositoryPath, ".git", "shallow")))
                 {
-                    options = StringUtil.Format($"--tags --prune --progress --no-recurse-submodules --unshallow {remoteName} {string.Join(" ", refSpec)}");
+                    options = StringUtil.Format($"{forceTag} --tags --prune {progress} --no-recurse-submodules --unshallow {remoteName} {string.Join(" ", refSpec)}");
                 }
             }
 
@@ -168,7 +196,25 @@ namespace Agent.Plugins.Repository
             int fetchExitCode = 0;
             while (retryCount < 3)
             {
+                Stopwatch watch = new Stopwatch();
+
+                watch.Start();
+
                 fetchExitCode = await ExecuteGitCommandAsync(context, repositoryPath, "fetch", options, additionalCommandLine, cancellationToken);
+
+                watch.Stop();
+
+                // Publish some fetch statistics
+                context.PublishTelemetry(area: "AzurePipelinesAgent", feature: "GitFetch", properties: new Dictionary<string, string>
+                {
+                    { "ElapsedTimeMilliseconds", $"{watch.ElapsedMilliseconds}" },
+                    { "RefSpec", string.Join(" ", refSpec) },
+                    { "RemoteName", remoteName },
+                    { "FetchDepth", $"{fetchDepth}" },
+                    { "ExitCode", $"{fetchExitCode}" },
+                    { "Options", options }
+                });
+
                 if (fetchExitCode == 0)
                 {
                     break;
@@ -284,7 +330,7 @@ namespace Agent.Plugins.Repository
             return await ExecuteGitCommandAsync(context, repositoryPath, "remote", StringUtil.Format($"set-url --push {remoteName} {remoteUrl}"));
         }
 
-        // git submodule foreach git clean -ffdx
+        // git submodule foreach --recursive "git clean -ffdx"
         public async Task<int> GitSubmoduleClean(AgentTaskPluginExecutionContext context, string repositoryPath)
         {
             context.Debug($"Delete untracked files/folders for submodules at {repositoryPath}.");
@@ -300,14 +346,14 @@ namespace Agent.Plugins.Repository
                 options = "-fdx";
             }
 
-            return await ExecuteGitCommandAsync(context, repositoryPath, "submodule", $"foreach git clean {options}");
+            return await ExecuteGitCommandAsync(context, repositoryPath, "submodule", $"foreach --recursive \"git clean {options}\"");
         }
 
-        // git submodule foreach git reset --hard HEAD
+        // git submodule foreach --recursive "git reset --hard HEAD"
         public async Task<int> GitSubmoduleReset(AgentTaskPluginExecutionContext context, string repositoryPath)
         {
             context.Debug($"Undo any changes to tracked files in the working tree for submodules at {repositoryPath}.");
-            return await ExecuteGitCommandAsync(context, repositoryPath, "submodule", "foreach git reset --hard HEAD");
+            return await ExecuteGitCommandAsync(context, repositoryPath, "submodule", "foreach --recursive \"git reset --hard HEAD\"");
         }
 
         // git submodule update --init --force [--depth=15] [--recursive]
@@ -519,7 +565,7 @@ namespace Agent.Plugins.Repository
             string arg = StringUtil.Format($"{command} {options}").Trim();
             context.Command($"git {arg}");
 
-            var processInvoker = new ProcessInvoker(context);
+            var processInvoker = new ProcessInvoker(context, disableWorkerCommands: true);
             processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
             {
                 context.Output(message.Data);
@@ -536,7 +582,7 @@ namespace Agent.Plugins.Repository
                 arguments: arg,
                 environment: gitEnv,
                 requireExitCodeZero: false,
-                outputEncoding: s_encoding,
+                outputEncoding: _encoding,
                 cancellationToken: cancellationToken);
         }
 
@@ -550,7 +596,7 @@ namespace Agent.Plugins.Repository
                 output = new List<string>();
             }
 
-            var processInvoker = new ProcessInvoker(context);
+            var processInvoker = new ProcessInvoker(context, disableWorkerCommands: true);
             processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
             {
                 output.Add(message.Data);
@@ -567,7 +613,7 @@ namespace Agent.Plugins.Repository
                 arguments: arg,
                 environment: gitEnv,
                 requireExitCodeZero: false,
-                outputEncoding: s_encoding,
+                outputEncoding: _encoding,
                 cancellationToken: default(CancellationToken));
         }
 
@@ -576,7 +622,7 @@ namespace Agent.Plugins.Repository
             string arg = StringUtil.Format($"{additionalCommandLine} {command} {options}").Trim();
             context.Command($"git {arg}");
 
-            var processInvoker = new ProcessInvoker(context);
+            var processInvoker = new ProcessInvoker(context, disableWorkerCommands: true);
             processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
             {
                 context.Output(message.Data);
@@ -593,7 +639,7 @@ namespace Agent.Plugins.Repository
                 arguments: arg,
                 environment: gitEnv,
                 requireExitCodeZero: false,
-                outputEncoding: s_encoding,
+                outputEncoding: _encoding,
                 cancellationToken: cancellationToken);
         }
     }

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
 using System.Linq;
@@ -54,6 +57,9 @@ namespace Microsoft.VisualStudio.Services.Agent
             {
                 Trace.Info($"Config authentication proxy as: {ProxyUsername}.");
             }
+
+            // Ensure proxy bypass list is loaded during the agent config
+            LoadProxyBypassList();
 
             _agentWebProxy.Update(ProxyAddress, ProxyUsername, ProxyPassword, ProxyBypassList);
         }
@@ -118,6 +124,26 @@ namespace Microsoft.VisualStudio.Services.Agent
             IOUtil.DeleteFile(proxyConfigFile);
         }
 
+        public void LoadProxyBypassList()
+        {
+            string proxyBypassFile = HostContext.GetConfigFile(WellKnownConfigFile.ProxyBypass);
+            if (File.Exists(proxyBypassFile))
+            {
+                Trace.Verbose($"Try read proxy bypass list from file: {proxyBypassFile}.");
+                foreach (string bypass in File.ReadAllLines(proxyBypassFile))
+                {
+                    if (string.IsNullOrWhiteSpace(bypass))
+                    {
+                        continue;
+                    }
+                    else
+                    {
+                        Trace.Info($"Bypass proxy for: {bypass}.");
+                        ProxyBypassList.Add(bypass.Trim());
+                    }
+                }
+            }
+        }
         private void LoadProxySetting()
         {
             string proxyConfigFile = HostContext.GetConfigFile(WellKnownConfigFile.Proxy);
@@ -140,7 +166,7 @@ namespace Microsoft.VisualStudio.Services.Agent
 
             if (!string.IsNullOrEmpty(ProxyAddress) && !Uri.IsWellFormedUriString(ProxyAddress, UriKind.Absolute))
             {
-                Trace.Info($"The proxy url is not a well formed absolute uri string: {ProxyAddress}.");
+                Trace.Error($"The proxy url is not a well formed absolute uri string: {ProxyAddress}.");
                 ProxyAddress = string.Empty;
             }
 
@@ -185,23 +211,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                     Trace.Info($"Config authentication proxy as: {ProxyUsername}.");
                 }
 
-                string proxyBypassFile = HostContext.GetConfigFile(WellKnownConfigFile.ProxyBypass);
-                if (File.Exists(proxyBypassFile))
-                {
-                    Trace.Verbose($"Try read proxy bypass list from file: {proxyBypassFile}.");
-                    foreach (string bypass in File.ReadAllLines(proxyBypassFile))
-                    {
-                        if (string.IsNullOrWhiteSpace(bypass))
-                        {
-                            continue;
-                        }
-                        else
-                        {
-                            Trace.Info($"Bypass proxy for: {bypass}.");
-                            ProxyBypassList.Add(bypass.Trim());
-                        }
-                    }
-                }
+                LoadProxyBypassList();
 
                 _agentWebProxy.Update(ProxyAddress, ProxyUsername, ProxyPassword, ProxyBypassList);
             }

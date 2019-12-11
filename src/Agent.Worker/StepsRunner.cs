@@ -1,11 +1,15 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Agent.Sdk;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
-using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.TeamFoundation.DistributedTask.Expressions;
+using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -14,6 +18,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         IExpressionNode Condition { get; set; }
         bool ContinueOnError { get; }
         string DisplayName { get; }
+        Pipelines.StepTarget Target { get; }
         bool Enabled { get; }
         IExecutionContext ExecutionContext { get; set; }
         TimeSpan? Timeout { get; }
@@ -200,34 +205,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             Trace.Info("Starting the step.");
             step.ExecutionContext.Section(StringUtil.Loc("StepStarting", step.DisplayName));
             step.ExecutionContext.SetTimeout(timeout: step.Timeout);
+            step.ExecutionContext.SetStepTarget(step.Target);
 
-#if OS_WINDOWS
-            if (step.ExecutionContext.Variables.Retain_Default_Encoding != true && Console.InputEncoding.CodePage != 65001)
-            {
-                using (var p = HostContext.CreateService<IProcessInvoker>())
-                {
-                    // Use UTF8 code page
-                    int exitCode = await p.ExecuteAsync(workingDirectory: HostContext.GetDirectory(WellKnownDirectory.Work),
-                                            fileName: WhichUtil.Which("chcp", true, Trace),
-                                            arguments: "65001",
-                                            environment: null,
-                                            requireExitCodeZero: false,
-                                            outputEncoding: null,
-                                            killProcessOnCancel: false,
-                                            redirectStandardIn: null,
-                                            inheritConsoleHandler: true,
-                                            cancellationToken: step.ExecutionContext.CancellationToken);
-                    if (exitCode == 0)
-                    {
-                        Trace.Info("Successfully returned to code page 65001 (UTF8)");
-                    }
-                    else
-                    {
-                        Trace.Warning($"'chcp 65001' failed with exit code {exitCode}");
-                    }
-                }
-            }
-#endif
+            // Windows may not be on the UTF8 codepage; try to fix that
+            await SwitchToUtf8Codepage(step);
 
             try
             {
@@ -319,6 +300,47 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             // Complete the step context.
             step.ExecutionContext.Section(StringUtil.Loc("StepFinishing", step.DisplayName));
             step.ExecutionContext.Complete();
+        }
+
+        private async Task SwitchToUtf8Codepage(IStep step)
+        {
+            if (!PlatformUtil.RunningOnWindows)
+            {
+                return;
+            }
+
+            try
+            {
+                if (step.ExecutionContext.Variables.Retain_Default_Encoding != true && Console.InputEncoding.CodePage != 65001)
+                {
+                    using (var p = HostContext.CreateService<IProcessInvoker>())
+                    {
+                        // Use UTF8 code page
+                        int exitCode = await p.ExecuteAsync(workingDirectory: HostContext.GetDirectory(WellKnownDirectory.Work),
+                                                fileName: WhichUtil.Which("chcp", true, Trace),
+                                                arguments: "65001",
+                                                environment: null,
+                                                requireExitCodeZero: false,
+                                                outputEncoding: null,
+                                                killProcessOnCancel: false,
+                                                redirectStandardIn: null,
+                                                inheritConsoleHandler: true,
+                                                cancellationToken: step.ExecutionContext.CancellationToken);
+                        if (exitCode == 0)
+                        {
+                            Trace.Info("Successfully returned to code page 65001 (UTF8)");
+                        }
+                        else
+                        {
+                            Trace.Warning($"'chcp 65001' failed with exit code {exitCode}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.Warning($"'chcp 65001' failed with exception {ex.Message}");
+            }
         }
     }
 }

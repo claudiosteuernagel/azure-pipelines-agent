@@ -1,3 +1,7 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Agent.Sdk;
 using System;
 using System.Diagnostics;
 using System.Linq;
@@ -58,7 +62,25 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener.Configuration
                 throw new NotSupportedException($"This Azure DevOps organization '{serverUrl}' is not backed by Azure Active Directory.");
             }
 
-            LoggerCallbackHandler.Callback = new AadTrace(trace);
+            LoggerCallbackHandler.LogCallback = ((LogLevel level, string message, bool containsPii) =>
+            {
+                switch (level)
+                {
+                    case LogLevel.Information:
+                        trace.Info(message);
+                        break;
+                    case LogLevel.Error:
+                        trace.Error(message);
+                        break;
+                    case LogLevel.Warning:
+                        trace.Warning(message);
+                        break;
+                    default:
+                        trace.Verbose(message);
+                        break;
+                }
+            });
+
             LoggerCallbackHandler.UseDefaultLogging = false;
             AuthenticationContext ctx = new AuthenticationContext(tenantAuthorityUrl.AbsoluteUri);
             var queryParameters = $"redirect_uri={Uri.EscapeDataString(new Uri(serverUrl).GetLeftPart(UriPartial.Authority))}";
@@ -70,13 +92,22 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener.Configuration
             {
                 try
                 {
-#if OS_WINDOWS
-                    Process.Start(new ProcessStartInfo() { FileName = codeResult.VerificationUrl, UseShellExecute = true });
-#elif OS_LINUX
-                    Process.Start(new ProcessStartInfo() { FileName = "xdg-open", Arguments = codeResult.VerificationUrl });
-#else
-                    Process.Start(new ProcessStartInfo() { FileName = "open", Arguments = codeResult.VerificationUrl });
-#endif
+                    if (PlatformUtil.RunningOnWindows)
+                    {
+                        Process.Start(new ProcessStartInfo() { FileName = codeResult.VerificationUrl, UseShellExecute = true });
+                    }
+                    else if (PlatformUtil.RunningOnLinux)
+                    {
+                        Process.Start(new ProcessStartInfo() { FileName = "xdg-open", Arguments = codeResult.VerificationUrl });
+                    }
+                    else if (PlatformUtil.RunningOnMacOS)
+                    {
+                        Process.Start(new ProcessStartInfo() { FileName = "open", Arguments = codeResult.VerificationUrl });
+                    }
+                    else
+                    {
+                        throw new NotImplementedException("Unexpected platform");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -131,37 +162,6 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener.Configuration
                 }
 
                 return null;
-            }
-        }
-
-        private class AadTrace : IAdalLogCallback
-        {
-            private Tracing _trace;
-
-            public AadTrace(Tracing trace)
-            {
-                _trace = trace;
-            }
-
-            public void Log(LogLevel level, string message)
-            {
-                switch (level)
-                {
-                    case LogLevel.Information:
-                        _trace.Info(message);
-                        break;
-                    case LogLevel.Verbose:
-                        _trace.Verbose(message);
-                        break;
-                    case LogLevel.Error:
-                        _trace.Error(message);
-                        break;
-                    case LogLevel.Warning:
-                        _trace.Warning(message);
-                        break;
-                    default:
-                        break;
-                }
             }
         }
     }

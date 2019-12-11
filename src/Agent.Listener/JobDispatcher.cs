@@ -1,4 +1,7 @@
-﻿using System;
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -10,23 +13,26 @@ using Microsoft.VisualStudio.Services.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using System.Linq;
 using Microsoft.VisualStudio.Services.Common;
+using System.Diagnostics;
+
 
 namespace Microsoft.VisualStudio.Services.Agent.Listener
 {
     [ServiceLocator(Default = typeof(JobDispatcher))]
     public interface IJobDispatcher : IAgentService
     {
-        void Run(Pipelines.AgentJobRequestMessage message);
+        TaskCompletionSource<bool> RunOnceJobCompleted { get; }
+        void Run(Pipelines.AgentJobRequestMessage message, bool runOnce = false);
         bool Cancel(JobCancelMessage message);
         Task WaitAsync(CancellationToken token);
         TaskResult GetLocalRunJobResult(AgentJobRequestMessage message);
         Task ShutdownAsync();
     }
 
-    // This implementation of IDobDispatcher is not thread safe.
+    // This implementation of IJobDispatcher is not thread safe.
     // It is base on the fact that the current design of agent is dequeue
     // and process one message from message queue everytime.
-    // In addition, it only execute one job every time, 
+    // In addition, it only execute one job every time,
     // and server will not send another job while this one is still running.
     public sealed class JobDispatcher : AgentService, IJobDispatcher
     {
@@ -42,6 +48,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
         //allow up to 30sec for any data to be transmitted over the process channel
         //timeout limit can be overwrite by environment VSTS_AGENT_CHANNEL_TIMEOUT
         private TimeSpan _channelTimeout;
+
+        private TaskCompletionSource<bool> _runOnceJobCompleted = new TaskCompletionSource<bool>();
 
         public override void Initialize(IHostContext hostContext)
         {
@@ -63,7 +71,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             Trace.Info($"Set agent/worker IPC timeout to {_channelTimeout.TotalSeconds} seconds.");
         }
 
-        public void Run(Pipelines.AgentJobRequestMessage jobRequestMessage)
+        public TaskCompletionSource<bool> RunOnceJobCompleted => _runOnceJobCompleted;
+
+        public void Run(Pipelines.AgentJobRequestMessage jobRequestMessage, bool runOnce = false)
         {
             Trace.Info($"Job request {jobRequestMessage.RequestId} for plan {jobRequestMessage.Plan.PlanId} job {jobRequestMessage.JobId} received.");
 
@@ -78,7 +88,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             }
 
             WorkerDispatcher newDispatch = new WorkerDispatcher(jobRequestMessage.JobId, jobRequestMessage.RequestId);
-            newDispatch.WorkerDispatch = RunAsync(jobRequestMessage, currentDispatch, newDispatch.WorkerCancellationTokenSource.Token, newDispatch.WorkerCancelTimeoutKillTokenSource.Token);
+            if (runOnce)
+            {
+                Trace.Info("Start dispatcher for one time used agent.");
+                newDispatch.WorkerDispatch = RunOnceAsync(jobRequestMessage, currentDispatch, newDispatch.WorkerCancellationTokenSource.Token, newDispatch.WorkerCancelTimeoutKillTokenSource.Token);
+            }
+            else
+            {
+                newDispatch.WorkerDispatch = RunAsync(jobRequestMessage, currentDispatch, newDispatch.WorkerCancellationTokenSource.Token, newDispatch.WorkerCancelTimeoutKillTokenSource.Token);
+            }
 
             _jobInfos.TryAdd(newDispatch.JobId, newDispatch);
             _jobDispatchedQueue.Enqueue(newDispatch.JobId);
@@ -134,7 +152,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                     }
                     catch (Exception ex)
                     {
-                        Trace.Error($"Worker Dispatch failed witn an exception for job request {currentDispatch.JobId}.");
+                        Trace.Error($"Worker Dispatch failed with an exception for job request {currentDispatch.JobId}.");
                         Trace.Error(ex);
                     }
                     finally
@@ -272,6 +290,19 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             }
         }
 
+        private async Task RunOnceAsync(Pipelines.AgentJobRequestMessage message, WorkerDispatcher previousJobDispatch, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
+        {
+            try
+            {
+                await RunAsync(message, previousJobDispatch, jobRequestCancellationToken, workerCancelTimeoutKillToken);
+            }
+            finally
+            {
+                Trace.Info("Fire signal for one time used agent.");
+                _runOnceJobCompleted.TrySetResult(true);
+            }
+        }
+
         private async Task RunAsync(Pipelines.AgentJobRequestMessage message, WorkerDispatcher previousJobDispatch, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
         {
             if (previousJobDispatch != null)
@@ -389,29 +420,40 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                                 requireExitCodeZero: false,
                                 outputEncoding: null,
                                 killProcessOnCancel: true,
+                                redirectStandardIn: null,
+                                inheritConsoleHandler: false,
+                                keepStandardInOpen: false,
+                                highPriorityProcess: true,
                                 cancellationToken: workerProcessCancelTokenSource.Token);
-                        });
+                        }
+                    );
 
                     // Send the job request message.
                     // Kill the worker process if sending the job message times out. The worker
                     // process may have successfully received the job message.
                     try
                     {
-                        Trace.Info($"Send job request message to worker for job {message.JobId}.");
+                        var body = JsonUtility.ToString(message);
+                        var numBytes = System.Text.ASCIIEncoding.Unicode.GetByteCount(body) / 1024;
+                        string numBytesString = numBytes > 0 ? $"{numBytes} KB" : " < 1 KB";
+                        Trace.Info($"Send job request message to worker for job {message.JobId} ({numBytesString}).");
                         HostContext.WritePerfCounter($"AgentSendingJobToWorker_{message.JobId}");
+                        var stopWatch = Stopwatch.StartNew();
                         using (var csSendJobRequest = new CancellationTokenSource(_channelTimeout))
                         {
                             await processChannel.SendAsync(
                                 messageType: MessageType.NewJobRequest,
-                                body: JsonUtility.ToString(message),
+                                body: body,
                                 cancellationToken: csSendJobRequest.Token);
                         }
+                        stopWatch.Stop();
+                        Trace.Info($"Took {stopWatch.ElapsedMilliseconds} ms to send job message to worker");
                     }
                     catch (OperationCanceledException)
                     {
                         // message send been cancelled.
                         // timeout 30 sec. kill worker.
-                        Trace.Info($"Job request message sending for job {message.JobId} been cancelled, kill running worker.");
+                        Trace.Info($"Job request message sending for job {message.JobId} been cancelled after waiting for {_channelTimeout.TotalSeconds} seconds, kill running worker.");
                         workerProcessCancelTokenSource.Cancel();
                         try
                         {
@@ -434,7 +476,24 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
 
                     // we get first jobrequest renew succeed and start the worker process with the job message.
                     // send notification to machine provisioner.
-                    await notification.JobStarted(message.JobId);
+                    var systemConnection = message.Resources.Endpoints.SingleOrDefault(x => string.Equals(x.Name, WellKnownServiceEndpointNames.SystemVssConnection, StringComparison.OrdinalIgnoreCase));
+                    var accessToken = systemConnection?.Authorization?.Parameters["AccessToken"];
+                    VariableValue identifier = new VariableValue("0");
+                    VariableValue definitionId = new VariableValue("0");
+
+                    if (message.Plan.PlanType == "Build")
+                    {
+                        message.Variables.TryGetValue("build.buildId", out identifier);
+                        message.Variables.TryGetValue("system.definitionId", out definitionId);
+                    }
+                    else if (message.Plan.PlanType == "Release")
+                    {
+                        message.Variables.TryGetValue("release.deploymentId", out identifier);
+                        message.Variables.TryGetValue("release.definitionId", out definitionId);
+                    }
+
+                    await notification.JobStarted(message.JobId, accessToken, systemConnection.Url, message.Plan.PlanId, identifier.Value, definitionId.Value, message.Plan.PlanType);
+
                     HostContext.WritePerfCounter($"SentJobToWorker_{requestId.ToString()}");
 
                     try
@@ -530,7 +589,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                             }
                         }
 
-                        // wait worker to exit 
+                        // wait worker to exit
                         // if worker doesn't exit within timeout, then kill worker.
                         completedTask = await Task.WhenAny(workerProcessTask, Task.Delay(-1, workerCancelTimeoutKillToken));
 
@@ -729,7 +788,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 }
                 catch (Exception ex)
                 {
-                    Trace.Error($"Catch exception during complete agent jobrequest {message.RequestId}.");
+                    Trace.Error($"Caught exception during complete agent jobrequest {message.RequestId}.");
                     Trace.Error(ex);
                     exceptions.Add(ex);
                 }

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Capabilities;
 using Microsoft.VisualStudio.Services.Agent.Listener.Configuration;
@@ -10,7 +13,6 @@ using System.Threading.Tasks;
 using System.Security.Cryptography;
 using System.IO;
 using System.Text;
-using Microsoft.VisualStudio.Services.WebApi;
 using Microsoft.VisualStudio.Services.OAuth;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -70,7 +72,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             {
                 Id = _settings.AgentId,
                 Name = _settings.AgentName,
-                Version = Constants.Agent.Version,
+                Version = BuildConstants.AgentPackage.Version,
                 OSDescription = RuntimeInformation.OSDescription,
             };
             string sessionName = $"{Environment.MachineName ?? "AGENT"}";

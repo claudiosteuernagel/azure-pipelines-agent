@@ -1,3 +1,7 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Agent.Sdk;
 using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
@@ -6,7 +10,6 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
-using Microsoft.VisualStudio.Services.Agent.Worker.Container;
 using Microsoft.VisualStudio.Services.WebApi;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
@@ -32,6 +35,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         List<ServiceEndpoint> Endpoints { get; }
         List<SecureFile> SecureFiles { get; }
         List<Pipelines.RepositoryResource> Repositories { get; }
+        Dictionary<string,string> JobSettings { get; }
 
         PlanFeatures Features { get; }
         Variables Variables { get; }
@@ -39,7 +43,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         HashSet<string> OutputVariables { get; }
         List<IAsyncCommandContext> AsyncCommands { get; }
         List<string> PrependPath { get; }
-        ContainerInfo Container { get; }
+        List<ContainerInfo> Containers { get; }
         List<ContainerInfo> SidecarContainers { get; }
 
         // Initialize
@@ -63,6 +67,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
         // others
         void ForceTaskComplete();
+        string TranslateToHostPath(string path);
+        ExecutionTargetInfo StepTarget();
+        void SetStepTarget(Pipelines.StepTarget target);
+        string TranslatePathForStepTarget(string val);
+        IHostContext GetHostContext();
     }
 
     public sealed class ExecutionContext : AgentService, IExecutionContext
@@ -74,12 +83,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         private readonly object _loggerLock = new object();
         private readonly List<IAsyncCommandContext> _asyncCommands = new List<IAsyncCommandContext>();
         private readonly HashSet<string> _outputvariables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
         private IAgentLogPlugin _logPlugin;
         private IPagingLogger _logger;
         private IJobServerQueue _jobServerQueue;
         private IExecutionContext _parentExecutionContext;
-
         private bool _outputForward = false;
         private Guid _mainTimelineId;
         private Guid _detailTimelineId;
@@ -87,6 +94,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         private CancellationTokenSource _cancellationTokenSource;
         private TaskCompletionSource<int> _forceCompleted = new TaskCompletionSource<int>();
         private bool _throttlingReported = false;
+        private ExecutionTargetInfo _defaultStepTarget;
+        private ExecutionTargetInfo _currentStepTarget;
 
         // only job level ExecutionContext will track throttling delay.
         private long _totalThrottlingDelayInMilliseconds = 0;
@@ -97,14 +106,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         public List<ServiceEndpoint> Endpoints { get; private set; }
         public List<SecureFile> SecureFiles { get; private set; }
         public List<Pipelines.RepositoryResource> Repositories { get; private set; }
+        public Dictionary<string, string> JobSettings { get; private set; }
         public Variables Variables { get; private set; }
         public Variables TaskVariables { get; private set; }
         public HashSet<string> OutputVariables => _outputvariables;
         public bool WriteDebug { get; private set; }
         public List<string> PrependPath { get; private set; }
-        public ContainerInfo Container { get; private set; }
+        public List<ContainerInfo> Containers { get; private set; }
         public List<ContainerInfo> SidecarContainers { get; private set; }
-
         public List<IAsyncCommandContext> AsyncCommands => _asyncCommands;
 
         public TaskResult? Result
@@ -159,6 +168,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             });
         }
 
+        public IHostContext GetHostContext()
+        {
+            return HostContext;
+        }
+
         public IExecutionContext CreateChild(Guid recordId, string displayName, string refName, Variables taskVariables = null, bool outputForward = false)
         {
             Trace.Entering();
@@ -169,15 +183,18 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             child.Variables = Variables;
             child.Endpoints = Endpoints;
             child.Repositories = Repositories;
+            child.JobSettings = JobSettings;
             child.SecureFiles = SecureFiles;
             child.TaskVariables = taskVariables;
             child._cancellationTokenSource = new CancellationTokenSource();
             child.WriteDebug = WriteDebug;
             child._parentExecutionContext = this;
             child.PrependPath = PrependPath;
-            child.Container = Container;
+            child.Containers = Containers;
             child.SidecarContainers = SidecarContainers;
             child._outputForward = outputForward;
+            child._defaultStepTarget = _defaultStepTarget;
+            child._currentStepTarget = _currentStepTarget;
 
             child.InitializeTimelineRecord(_mainTimelineId, recordId, _record.Id, ExecutionContextType.Task, displayName, refName, ++_childTimelineRecordOrder);
 
@@ -243,11 +260,6 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         {
             ArgUtil.NotNullOrEmpty(name, nameof(name));
 
-            if (isFilePath && Container != null)
-            {
-                value = Container.TranslateToContainerPath(value);
-            }
-
             if (isOutput || OutputVariables.Contains(name))
             {
                 _record.Variables[name] = new VariableValue()
@@ -303,7 +315,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     issue.Data["logFileLineNumber"] = logLineNumber.ToString();
                 }
 
-                if (_record.ErrorCount <= _maxIssueCount)
+                if (_record.ErrorCount < _maxIssueCount)
                 {
                     _record.Issues.Add(issue);
                 }
@@ -320,7 +332,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     issue.Data["logFileLineNumber"] = logLineNumber.ToString();
                 }
 
-                if (_record.WarningCount <= _maxIssueCount)
+                if (_record.WarningCount < _maxIssueCount)
                 {
                     _record.Issues.Add(issue);
                 }
@@ -396,9 +408,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             // Repositories
             Repositories = message.Resources.Repositories;
 
+            // JobSettings
+            JobSettings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            JobSettings[WellKnownJobSettings.HasMultipleCheckouts] = message.Steps?.Where(x => Pipelines.PipelineConstants.IsCheckoutTask(x)).Count() > 1 ? Boolean.TrueString : Boolean.FalseString;
+
             // Variables (constructor performs initial recursive expansion)
             List<string> warnings;
             Variables = new Variables(HostContext, message.Variables, out warnings);
+            Variables.StringTranslator = TranslatePathForStepTarget;
 
             // Prepend Path
             PrependPath = new List<string>();
@@ -410,6 +427,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 imageName = Environment.GetEnvironmentVariable("_PREVIEW_VSTS_DOCKER_IMAGE");
             }
 
+            Containers = new List<ContainerInfo>();
+            _defaultStepTarget = null;
+            _currentStepTarget = null;
             if (!string.IsNullOrEmpty(imageName) &&
                 string.IsNullOrEmpty(message.JobContainer))
             {
@@ -418,15 +438,24 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     Alias = "vsts_container_preview"
                 };
                 dockerContainer.Properties.Set("image", imageName);
-                Container = new ContainerInfo(HostContext, dockerContainer);
+                var defaultJobContainer = HostContext.CreateContainerInfo(dockerContainer);
+                _defaultStepTarget = defaultJobContainer;
+                Containers.Add(defaultJobContainer);
             }
             else if (!string.IsNullOrEmpty(message.JobContainer))
             {
-                Container = new ContainerInfo(HostContext, message.Resources.Containers.Single(x => string.Equals(x.Alias, message.JobContainer, StringComparison.OrdinalIgnoreCase)));
+                var defaultJobContainer = HostContext.CreateContainerInfo(message.Resources.Containers.Single(x => string.Equals(x.Alias, message.JobContainer, StringComparison.OrdinalIgnoreCase)));
+                _defaultStepTarget = defaultJobContainer;
+                Containers.Add(defaultJobContainer);
             }
             else
             {
-                Container = null;
+                _defaultStepTarget = new HostInfo();
+            }
+            // Include other step containers
+            foreach (var container in message.Resources.Containers.Where(x => !string.Equals(x.Alias, message.JobContainer, StringComparison.OrdinalIgnoreCase)))
+            {
+                Containers.Add(HostContext.CreateContainerInfo(container));
             }
 
             // Docker (Sidecar Containers)
@@ -436,7 +465,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 var networkAlias = sidecar.Key;
                 var containerResourceAlias = sidecar.Value;
                 var containerResource = message.Resources.Containers.Single(c => string.Equals(c.Alias, containerResourceAlias, StringComparison.OrdinalIgnoreCase));
-                SidecarContainers.Add(new ContainerInfo(HostContext, containerResource, isJobContainer: false) { ContainerNetworkAlias = networkAlias });
+                ContainerInfo containerInfo = HostContext.CreateContainerInfo(containerResource, isJobContainer: false);
+                containerInfo.ContainerNetworkAlias = networkAlias;
+                SidecarContainers.Add(containerInfo);
             }
 
             // Proxy variables
@@ -494,12 +525,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             var runtimeOptions = HostContext.GetService<IConfigurationStore>().GetAgentRuntimeOptions();
             if (runtimeOptions != null)
             {
-#if OS_WINDOWS
-                if (runtimeOptions.GitUseSecureChannel)
+                if (PlatformUtil.RunningOnWindows && runtimeOptions.GitUseSecureChannel)
                 {
                     Variables.Set(Constants.Variables.Agent.GitUseSChannel, runtimeOptions.GitUseSecureChannel.ToString());
                 }
-#endif                
             }
 
             // Job timeline record.
@@ -549,7 +578,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 }
             }
 
-            // write to plugin daemon, 
+            // write to plugin daemon,
             if (_outputForward)
             {
                 if (_logPlugin == null)
@@ -560,7 +589,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 _logPlugin.Write(_record.Id, msg);
             }
 
-            _jobServerQueue.QueueWebConsoleLine(_record.Id, msg);
+            _jobServerQueue.QueueWebConsoleLine(_record.Id, msg, totalLines);
             return totalLines;
         }
 
@@ -622,12 +651,84 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     query["tab"] = "pipelines";
                     query["queryDate"] = queryDate;
 
+                    // Global RU link
                     uriBuilder.Query = query.ToString();
+                    string global = StringUtil.Loc("ServerTarpitUrl", uriBuilder.ToString());
 
-                    this.Warning(StringUtil.Loc("ServerTarpitUrl", uriBuilder.ToString()));
+                    if (!String.IsNullOrEmpty(this.Variables.Build_DefinitionName))
+                    {
+                        query["keywords"] = this.Variables.Build_Number;
+                        query["definition"] = this.Variables.Build_DefinitionName;
+                    }
+                    else if (!String.IsNullOrEmpty(this.Variables.Release_ReleaseName))
+                    {
+                        query["keywords"] = this.Variables.Release_ReleaseId;
+                        query["definition"] = this.Variables.Release_ReleaseName;
+                    }
+
+                    // RU link scoped for the build/release
+                    uriBuilder.Query = query.ToString();
+                    this.Warning($"{global}\n{StringUtil.Loc("ServerTarpitUrlScoped", uriBuilder.ToString())}");
                 }
 
                 _throttlingReported = true;
+            }
+        }
+
+        public string TranslateToHostPath(string path)
+        {
+            var stepTarget = StepTarget();
+            if (stepTarget != null)
+            {
+                return stepTarget.TranslateToHostPath(path);
+            }
+            return path;
+        }
+
+        public string TranslatePathForStepTarget(string val)
+        {
+            var stepTarget = StepTarget();
+            if (stepTarget != null)
+            {
+                return stepTarget.TranslateContainerPathForImageOS(PlatformUtil.HostOS, stepTarget.TranslateToContainerPath(val));
+            }
+            return val;
+        }
+
+        public ExecutionTargetInfo StepTarget()
+        {
+            if (_currentStepTarget != null)
+            {
+                return _currentStepTarget;
+            }
+
+            return _defaultStepTarget;
+        }
+
+        public void SetStepTarget(Pipelines.StepTarget target)
+        {
+            // Enforce command restriction if set for the step target
+            var commandManager = HostContext.GetService<IWorkerCommandManager>();
+            if (string.Equals(WellKnownStepTargetStrings.Restricted, target?.Commands, StringComparison.OrdinalIgnoreCase))
+            {
+                commandManager.SetCommandRestrictionPolicy(new AttributeBasedWorkerCommandRestrictionPolicy());
+            }
+            else
+            {
+                commandManager.SetCommandRestrictionPolicy(new UnrestricedWorkerCommandRestrictionPolicy());
+            }
+
+            // When step targets are set, we need to take over control for translating paths
+            // from the job execution context
+            Variables.StringTranslator = TranslatePathForStepTarget;
+
+            if (string.Equals(WellKnownStepTargetStrings.Host, target?.Target, StringComparison.OrdinalIgnoreCase))
+            {
+                _currentStepTarget = new HostInfo();
+            }
+            else
+            {
+                _currentStepTarget = Containers.FirstOrDefault(x => string.Equals(x.ContainerName, target?.Target, StringComparison.OrdinalIgnoreCase));
             }
         }
     }
@@ -694,5 +795,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         public static readonly string Error = "##[error]";
         public static readonly string Warning = "##[warning]";
         public static readonly string Debug = "##[debug]";
+    }
+
+    public static class WellKnownStepTargetStrings
+    {
+        public static readonly string Host = "host";
+        public static readonly string Restricted = "restricted";
     }
 }

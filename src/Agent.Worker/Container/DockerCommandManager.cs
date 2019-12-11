@@ -1,6 +1,9 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using Agent.Sdk;
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -48,13 +51,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Container
 
         public async Task<DockerVersion> DockerVersion(IExecutionContext context)
         {
-            string serverVersionStr = (await ExecuteDockerCommandAsync(context, "version", "--format '{{.Server.Version}}'")).FirstOrDefault();
+            string serverVersionStr = (await ExecuteDockerCommandAsync(context, "version", "--format '{{.Server.APIVersion}}'")).FirstOrDefault();
             ArgUtil.NotNullOrEmpty(serverVersionStr, "Docker.Server.Version");
-            context.Output($"Docker daemon version: {serverVersionStr}");
+            context.Output($"Docker daemon API version: {serverVersionStr}");
 
-            string clientVersionStr = (await ExecuteDockerCommandAsync(context, "version", "--format '{{.Client.Version}}'")).FirstOrDefault();
+            string clientVersionStr = (await ExecuteDockerCommandAsync(context, "version", "--format '{{.Client.APIVersion}}'")).FirstOrDefault();
             ArgUtil.NotNullOrEmpty(serverVersionStr, "Docker.Client.Version");
-            context.Output($"Docker client version: {clientVersionStr}");
+            context.Output($"Docker client API version: {clientVersionStr}");
 
             // we interested about major.minor.patch version
             Regex verRegex = new Regex("\\d+\\.\\d+(\\.\\d+)?", RegexOptions.IgnoreCase);
@@ -84,12 +87,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Container
 
         public async Task<int> DockerLogin(IExecutionContext context, string server, string username, string password)
         {
-#if OS_WINDOWS
-            // Wait for 17.07 to switch using stdin for docker registry password.
-            return await ExecuteDockerCommandAsync(context, "login", $"--username \"{username}\" --password \"{password.Replace("\"", "\\\"")}\" {server}", new List<string>() { password }, context.CancellationToken);
-#else
+            if (PlatformUtil.RunningOnWindows)
+            {
+                // Wait for 17.07 to switch using stdin for docker registry password.
+                return await ExecuteDockerCommandAsync(context, "login", $"--username \"{username}\" --password \"{password.Replace("\"", "\\\"")}\" {server}", new List<string>() { password }, context.CancellationToken);
+            }
             return await ExecuteDockerCommandAsync(context, "login", $"--username \"{username}\" --password-stdin {server}", new List<string>() { password }, context.CancellationToken);
-#endif
         }
 
         public async Task<int> DockerLogout(IExecutionContext context, string server)
@@ -137,15 +140,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Container
             {
                 // replace `"` with `\"` and add `"{0}"` to all path.
                 String volumeArg;
+                String targetVolume = container.TranslateContainerPathForImageOS(PlatformUtil.HostOS, volume.TargetVolumePath).Replace("\"", "\\\"");
+
                 if (String.IsNullOrEmpty(volume.SourceVolumePath))
                 {
                     // Anonymous docker volume
-                    volumeArg = $"-v \"{volume.TargetVolumePath.Replace("\"", "\\\"")}\"";
+                    volumeArg = $"-v \"{targetVolume}\"";
                 }
                 else
                 {
                     // Named Docker volume / host bind mount
-                    volumeArg = $"-v \"{volume.SourceVolumePath.Replace("\"", "\\\"")}\":\"{volume.TargetVolumePath.Replace("\"", "\\\"")}\"";
+                    volumeArg = $"-v \"{volume.SourceVolumePath.Replace("\"", "\\\"")}\":\"{targetVolume}\"";
                 }
                 if (volume.ReadOnly)
                 {
@@ -186,11 +191,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Container
 
         public async Task<int> DockerNetworkCreate(IExecutionContext context, string network)
         {
-#if OS_WINDOWS
-            return await ExecuteDockerCommandAsync(context, "network", $"create --label {DockerInstanceLabel} {network} --driver nat", context.CancellationToken);
-#else
+            var usingWindowsContainers = context.Containers.Where(x => x.ExecutionOS != PlatformUtil.OS.Windows).Count() == 0;
+            var networkDrivers = await ExecuteDockerCommandAsync(context, "info", "-f \"{{range .Plugins.Network}}{{println .}}{{end}}\"");
+            if (usingWindowsContainers && networkDrivers.Contains("nat"))
+            {
+                return await ExecuteDockerCommandAsync(context, "network", $"create --label {DockerInstanceLabel} {network} --driver nat", context.CancellationToken);
+            }
             return await ExecuteDockerCommandAsync(context, "network", $"create --label {DockerInstanceLabel} {network}", context.CancellationToken);
-#endif
         }
 
         public async Task<int> DockerNetworkRemove(IExecutionContext context, string network)
